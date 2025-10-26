@@ -35,7 +35,9 @@ BASE_MODEL="lerobot/pi05_base"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 JOB_NAME="${JOB_NAME:=pi05_speedrun_${TIMESTAMP}}"
 OUTPUT_DIR="${OUTPUT_DIR:=./outputs/${JOB_NAME}}"
-LOG_FILE="${OUTPUT_DIR}/training.log"
+# Use temp log file until training starts (LeRobot creates OUTPUT_DIR)
+LOG_FILE="/tmp/lerobot_train_${TIMESTAMP}.log"
+FINAL_LOG_FILE="${OUTPUT_DIR}/training.log"
 
 # Training hyperparameters
 STEPS="${STEPS:=3000}"
@@ -140,9 +142,8 @@ else
     fi
 fi
 
-# Create output directory (backup will be handled before training starts)
-mkdir -p "$OUTPUT_DIR"
-print_success "Output directory: $OUTPUT_DIR"
+# Note: Output directory will be created by LeRobot during training
+print_success "Output directory will be: $OUTPUT_DIR"
 
 # ============================================================================
 # Environment Setup
@@ -380,24 +381,23 @@ log_step "Training command built successfully"
 print_header "Starting Training"
 
 log_step "Starting Pi0.5 training on $DATASET_REPO"
-echo "Training will be logged to: $LOG_FILE"
+echo "Training will be logged to: $FINAL_LOG_FILE"
+echo "Pre-training logs in: $LOG_FILE"
 echo ""
 
-# Handle existing output directory if resuming from checkpoint
+# Check if resuming from checkpoint
 if [ "$RESUME_FROM_CHECKPOINT" = "true" ]; then
     if [ ! -d "$OUTPUT_DIR" ]; then
         print_error "RESUME_FROM_CHECKPOINT is true but $OUTPUT_DIR does not exist"
         exit 1
     fi
     print_success "Resuming training from $OUTPUT_DIR"
-else
-    # Clean directory if it exists (normally shouldn't with unique timestamps)
-    if [ -d "$OUTPUT_DIR" ]; then
-        print_warning "Output directory $OUTPUT_DIR already exists. Cleaning it."
-        rm -rf "$OUTPUT_DIR"
-    fi
-    mkdir -p "$OUTPUT_DIR"
+    # Use the existing log file when resuming
+    LOG_FILE="$FINAL_LOG_FILE"
 fi
+
+# Note: We do NOT create OUTPUT_DIR here - LeRobot will create it
+# This avoids the FileExistsError
 
 # Set environment variables
 export HF_TOKEN
@@ -410,10 +410,20 @@ START_TIME=$(date +%s)
 log_step "Training started at $(date '+%Y-%m-%d %H:%M:%S')"
 
 # Execute training
-if eval "$TRAIN_CMD" | tee -a "$LOG_FILE"; then
+if eval "$TRAIN_CMD" 2>&1 | tee -a "$LOG_FILE"; then
     TRAIN_SUCCESS=true
 else
     TRAIN_SUCCESS=false
+fi
+
+# Move temp log to final location
+if [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    # Create output dir if training failed before creating it
+    mkdir -p "$OUTPUT_DIR"
+    # Copy temp log to final location (overwrite, not append)
+    cat "$LOG_FILE" > "$FINAL_LOG_FILE"
+    # Continue using final log file for post-training messages
+    LOG_FILE="$FINAL_LOG_FILE"
 fi
 
 # Record end time
