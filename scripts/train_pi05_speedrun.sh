@@ -138,6 +138,16 @@ else
     fi
 fi
 
+# Handle existing output directory
+if [ -d "$OUTPUT_DIR" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    print_warning "Output directory $OUTPUT_DIR already exists"
+
+    # Create a backup with timestamp
+    BACKUP_DIR="${OUTPUT_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
+    print_warning "Moving existing directory to $BACKUP_DIR"
+    mv "$OUTPUT_DIR" "$BACKUP_DIR"
+fi
+
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 print_success "Output directory: $OUTPUT_DIR"
