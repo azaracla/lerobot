@@ -293,7 +293,7 @@ TRAIN_CMD="$TRAIN_CMD --num_workers=$NUM_WORKERS"
 
 # Optimizer and learning rate
 TRAIN_CMD="$TRAIN_CMD --optimizer.lr=$EFFECTIVE_LR"
-TRAIN_CMD="$TRAIN_CMD --optimizer.warmup_steps=$WARMUP_STEPS"
+TRAIN_CMD="$TRAIN_CMD --scheduler.num_warmup_steps=$WARMUP_STEPS"
 
 # Model optimization for faster training
 TRAIN_CMD="$TRAIN_CMD --policy.compile_model=true"
