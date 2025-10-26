@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # π₀.₅ Training Speedrun Script for Vast.ai
-# Automated training pipeline for LeRobot Pi0.5 on smolvla_3dprint_plate dataset
+# Automated training pipeline for LeRobot Pi0.5 on so101_3dprint_plate dataset
 # Inspired by: https://github.com/karpathy/nanochat/blob/master/speedrun.sh
 #
 # Multi-GPU Support:
@@ -40,7 +40,7 @@ STEPS="${STEPS:=3000}"
 BATCH_SIZE="${BATCH_SIZE:=32}"
 NUM_WORKERS="${NUM_WORKERS:=4}"
 LEARNING_RATE="${LEARNING_RATE:=1e-4}"
-WARMUP_STEPS="${WARMUP_STEPS:=100}"
+# Note: WARMUP_STEPS removed - scheduler uses policy defaults
 LOG_FREQ="${LOG_FREQ:=100}"
 SAVE_FREQ="${SAVE_FREQ:=500}"
 
@@ -293,7 +293,7 @@ TRAIN_CMD="$TRAIN_CMD --num_workers=$NUM_WORKERS"
 
 # Optimizer and learning rate
 TRAIN_CMD="$TRAIN_CMD --optimizer.lr=$EFFECTIVE_LR"
-TRAIN_CMD="$TRAIN_CMD --scheduler.num_warmup_steps=$WARMUP_STEPS"
+# Note: scheduler parameters use policy defaults (warmup is policy-specific)
 
 # Model optimization for faster training
 TRAIN_CMD="$TRAIN_CMD --policy.compile_model=true"
