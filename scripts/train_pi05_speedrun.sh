@@ -41,7 +41,8 @@ FINAL_LOG_FILE="${OUTPUT_DIR}/training.log"
 
 # Training hyperparameters
 STEPS="${STEPS:=3000}"
-BATCH_SIZE="${BATCH_SIZE:=32}"
+# Reduced batch size for multi-GPU (Pi0.5 is 3.6B params, very large)
+BATCH_SIZE="${BATCH_SIZE:=8}"
 NUM_WORKERS="${NUM_WORKERS:=4}"
 LEARNING_RATE="${LEARNING_RATE:=1e-4}"
 # Note: WARMUP_STEPS removed - scheduler uses policy defaults
@@ -404,6 +405,9 @@ export HF_TOKEN
 export WANDB_API_KEY
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1
+
+# Memory optimization for large models
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Record start time
 START_TIME=$(date +%s)
