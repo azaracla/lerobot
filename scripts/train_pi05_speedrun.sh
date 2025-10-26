@@ -29,7 +29,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-DATASET_REPO="azaracla/smolvla_3dprint_plate"
+DATASET_REPO="azaracla/so101_3dprint_plate"
 BASE_MODEL="lerobot/pi05_base"
 OUTPUT_DIR="${OUTPUT_DIR:=./outputs/pi05_speedrun}"
 JOB_NAME="${JOB_NAME:=pi05_speedrun_$(date +%Y%m%d_%H%M%S)}"
