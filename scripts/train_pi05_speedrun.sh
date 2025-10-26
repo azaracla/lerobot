@@ -42,7 +42,7 @@ FINAL_LOG_FILE="${OUTPUT_DIR}/training.log"
 # Training hyperparameters
 STEPS="${STEPS:=3000}"
 # Reduced batch size for multi-GPU (Pi0.5 is 3.6B params, very large)
-BATCH_SIZE="${BATCH_SIZE:=8}"
+BATCH_SIZE="${BATCH_SIZE:=16}"
 NUM_WORKERS="${NUM_WORKERS:=4}"
 LEARNING_RATE="${LEARNING_RATE:=1e-4}"
 # Note: WARMUP_STEPS removed - scheduler uses policy defaults
