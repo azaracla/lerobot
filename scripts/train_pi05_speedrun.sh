@@ -32,8 +32,9 @@ NC='\033[0m' # No Color
 # Configuration
 DATASET_REPO="azaracla/so101_3dprint_plate"
 BASE_MODEL="lerobot/pi05_base"
-OUTPUT_DIR="${OUTPUT_DIR:=./outputs/pi05_speedrun}"
-JOB_NAME="${JOB_NAME:=pi05_speedrun_$(date +%Y%m%d_%H%M%S)}"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+JOB_NAME="${JOB_NAME:=pi05_speedrun_${TIMESTAMP}}"
+OUTPUT_DIR="${OUTPUT_DIR:=./outputs/${JOB_NAME}}"
 LOG_FILE="${OUTPUT_DIR}/training.log"
 
 # Training hyperparameters
@@ -382,24 +383,20 @@ log_step "Starting Pi0.5 training on $DATASET_REPO"
 echo "Training will be logged to: $LOG_FILE"
 echo ""
 
-# Handle existing output directory to avoid LeRobot's FileExistsError
-# Clean it completely if not resuming from checkpoint
-if [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
-    if [ -d "$OUTPUT_DIR" ]; then
-        # Check if there are any important files (checkpoints, models)
-        if ls "$OUTPUT_DIR"/checkpoints/* 2>/dev/null || ls "$OUTPUT_DIR"/*.safetensors 2>/dev/null; then
-            # Create backup with timestamp
-            BACKUP_DIR="${OUTPUT_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
-            print_warning "Found existing checkpoints. Backing up to $BACKUP_DIR"
-            mv "$OUTPUT_DIR" "$BACKUP_DIR"
-            mkdir -p "$OUTPUT_DIR"
-        else
-            # Just clean the directory if no important files
-            print_warning "Cleaning existing output directory"
-            rm -rf "$OUTPUT_DIR"
-            mkdir -p "$OUTPUT_DIR"
-        fi
+# Handle existing output directory if resuming from checkpoint
+if [ "$RESUME_FROM_CHECKPOINT" = "true" ]; then
+    if [ ! -d "$OUTPUT_DIR" ]; then
+        print_error "RESUME_FROM_CHECKPOINT is true but $OUTPUT_DIR does not exist"
+        exit 1
     fi
+    print_success "Resuming training from $OUTPUT_DIR"
+else
+    # Clean directory if it exists (normally shouldn't with unique timestamps)
+    if [ -d "$OUTPUT_DIR" ]; then
+        print_warning "Output directory $OUTPUT_DIR already exists. Cleaning it."
+        rm -rf "$OUTPUT_DIR"
+    fi
+    mkdir -p "$OUTPUT_DIR"
 fi
 
 # Set environment variables
