@@ -15,6 +15,7 @@
 # ============================================================================
 
 set -e  # Exit on first error
+set -o pipefail  # Ensure pipe failures are caught
 
 # Change to project root directory (parent of scripts/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -138,17 +139,7 @@ else
     fi
 fi
 
-# Handle existing output directory
-if [ -d "$OUTPUT_DIR" ] && [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
-    print_warning "Output directory $OUTPUT_DIR already exists"
-
-    # Create a backup with timestamp
-    BACKUP_DIR="${OUTPUT_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
-    print_warning "Moving existing directory to $BACKUP_DIR"
-    mv "$OUTPUT_DIR" "$BACKUP_DIR"
-fi
-
-# Create output directory
+# Create output directory (backup will be handled before training starts)
 mkdir -p "$OUTPUT_DIR"
 print_success "Output directory: $OUTPUT_DIR"
 
@@ -390,6 +381,26 @@ print_header "Starting Training"
 log_step "Starting Pi0.5 training on $DATASET_REPO"
 echo "Training will be logged to: $LOG_FILE"
 echo ""
+
+# Handle existing output directory to avoid LeRobot's FileExistsError
+# Clean it completely if not resuming from checkpoint
+if [ "$RESUME_FROM_CHECKPOINT" != "true" ]; then
+    if [ -d "$OUTPUT_DIR" ]; then
+        # Check if there are any important files (checkpoints, models)
+        if ls "$OUTPUT_DIR"/checkpoints/* 2>/dev/null || ls "$OUTPUT_DIR"/*.safetensors 2>/dev/null; then
+            # Create backup with timestamp
+            BACKUP_DIR="${OUTPUT_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
+            print_warning "Found existing checkpoints. Backing up to $BACKUP_DIR"
+            mv "$OUTPUT_DIR" "$BACKUP_DIR"
+            mkdir -p "$OUTPUT_DIR"
+        else
+            # Just clean the directory if no important files
+            print_warning "Cleaning existing output directory"
+            rm -rf "$OUTPUT_DIR"
+            mkdir -p "$OUTPUT_DIR"
+        fi
+    fi
+fi
 
 # Set environment variables
 export HF_TOKEN
