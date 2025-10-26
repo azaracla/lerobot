@@ -5,6 +5,9 @@
 
 set -e
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -179,8 +182,8 @@ read -p "Press Enter to start training or Ctrl+C to cancel..."
 export ENABLE_WANDB="${WANDB_API_KEY:+true}"
 export PUSH_TO_HUB="${PUSH_TO_HUB:-true}"
 
-# Run training
-bash train_pi05_speedrun.sh
+# Run training (use absolute path to script in same directory)
+bash "$SCRIPT_DIR/train_pi05_speedrun.sh"
 
 # Success message
 print_header "Training Complete!"

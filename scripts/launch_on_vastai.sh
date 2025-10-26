@@ -96,15 +96,15 @@ export OUTPUT_DIR="./outputs/pi05_speedrun"
 export PUSH_TO_HUB=true
 export TOKENIZERS_PARALLELISM=false
 
-# Make sure training script exists
-if [ ! -f "train_pi05_speedrun.sh" ]; then
-    echo "Downloading training script..."
-    curl -L https://raw.githubusercontent.com/huggingface/lerobot/main/train_pi05_speedrun.sh -o train_pi05_speedrun.sh
-    chmod +x train_pi05_speedrun.sh
+# Make sure training script exists (now in scripts/ directory)
+if [ ! -f "scripts/train_pi05_speedrun.sh" ]; then
+    echo "Error: Training script not found at scripts/train_pi05_speedrun.sh"
+    echo "Make sure you have the latest version of the lerobot repository."
+    exit 1
 fi
 
 # Execute training
-bash train_pi05_speedrun.sh
+bash scripts/train_pi05_speedrun.sh
 
 # ============================================================================
 # Completion
