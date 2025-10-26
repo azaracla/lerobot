@@ -1,0 +1,138 @@
+# π₀.₅ Training Configuration
+# This YAML file documents all available training parameters
+# You don't need to use this file directly - use environment variables instead
+# This is for reference and advanced customization
+
+dataset:
+  # Dataset repository ID on HuggingFace
+  repo_id: "azaracla/smolvla_3dprint_plate"
+
+  # Whether to stream dataset (load iteratively) or download fully
+  streaming: false
+
+  # Number of data loading workers
+  num_workers: 4
+
+policy:
+  # Policy type
+  type: "pi05"
+
+  # Base model to fine-tune from
+  pretrained_path: "lerobot/pi05_base"
+
+  # Device to train on
+  device: "cuda"
+
+  # Model precision
+  dtype: "bfloat16"  # Options: "float32", "float16", "bfloat16"
+
+  # Optimization flags
+  compile_model: true              # Compile model for faster training (requires PyTorch 2.0+)
+  gradient_checkpointing: true     # Save memory by recomputing gradients during backward
+
+  # Normalization mapping for different feature types
+  normalization_mapping:
+    ACTION: "MEAN_STD"             # Normalize actions with mean/std
+    STATE: "MEAN_STD"              # Normalize state with mean/std
+    VISUAL: "IDENTITY"             # Don't normalize images
+
+  # HuggingFace Hub pushing
+  push_to_hub: true
+  repo_id: ""                      # Set to "your_username/model_name"
+
+training:
+  # Number of training steps
+  steps: 3000
+
+  # Batch size per GPU
+  batch_size: 32
+
+  # Optimizer configuration
+  optimizer:
+    type: "adam"
+    lr: 1.0e-4                     # Learning rate
+    weight_decay: 1.0e-4           # L2 regularization
+    warmup_steps: 100              # Warmup steps (gradual LR increase)
+    grad_clip_norm: 1.0            # Max gradient norm for clipping
+
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"                 # Options: "cosine", "linear", "constant"
+    num_warmup_steps: 100
+    num_training_steps: 3000
+
+  # Checkpointing
+  save_checkpoint: true
+  save_freq: 500                   # Save checkpoint every N steps
+  log_freq: 100                    # Log metrics every N steps
+
+  # Output directory
+  output_dir: "./outputs/pi05_speedrun"
+
+  # Random seed for reproducibility
+  seed: 42
+
+# Logging and monitoring
+wandb:
+  enable: true                     # Enable Weights & Biases tracking
+  project: "lerobot-pi05"          # Wandb project name
+  entity: ""                       # Wandb team/user name (optional)
+  tags:
+    - "pi05"
+    - "speedrun"
+    - "fine-tuning"
+
+# Evaluation settings (optional, only for simulated environments)
+eval:
+  enable: false                    # Set to true to evaluate on sim env during training
+  freq: 1000                       # Evaluate every N steps
+  batch_size: 4                    # Evaluation batch size
+  num_episodes: 10                 # Episodes per evaluation
+
+# Advanced settings
+advanced:
+  # Mixed precision training
+  mixed_precision: "bf16"          # Options: "no", "fp16", "bf16"
+
+  # Distributed training
+  num_processes: 1                 # Auto-detect if 0
+  distributed_backend: "nccl"      # For multi-GPU
+
+  # Data augmentation (if supported by policy)
+  augmentation_enabled: false
+
+  # Resume from checkpoint
+  resume: false
+  checkpoint_path: ""              # Path to checkpoint directory
+
+# Dataset-specific settings
+dataset_config:
+  # Delta timestamps for frame loading
+  # Defines which past/future frames to load relative to current
+  delta_timestamps:
+    observation:
+      image: [-0.1, 0.0]          # Load image 100ms before and current
+      state: [-0.1, 0.0]          # Load state 100ms before and current
+    action: [0.0]                 # Load current action
+
+  # Rename features if dataset has different naming
+  rename_map: {}                  # e.g., {"rgb": "observation.image"}
+
+# Hardware optimization
+hardware:
+  # GPU memory optimization
+  gpu_memory_fraction: 0.95        # Use up to 95% of GPU memory
+
+  # CPU optimization
+  num_workers: 4                   # Data loading workers
+  pin_memory: true                 # Pin memory for faster GPU transfer
+
+  # CUDA optimization
+  cuda_benchmark: true             # Enable CUDA benchmarking for speed
+  matmul_precision: "high"         # Matrix multiplication precision
+
+# Debugging
+debug:
+  verbose: false                   # Print detailed logs
+  save_training_state: true        # Save optimizer state in checkpoints
+  record_batch_logs: false         # Log first batch as verification
