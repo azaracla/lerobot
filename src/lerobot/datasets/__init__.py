@@ -20,9 +20,10 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
+from lerobot.datasets.transforms import DroidRandomResizedCrop, ImageTransforms, ImageTransformsConfig
 
 __all__ = [
+    "DroidRandomResizedCrop",
     "EpisodeAwareSampler",
     "ImageTransforms",
     "ImageTransformsConfig",

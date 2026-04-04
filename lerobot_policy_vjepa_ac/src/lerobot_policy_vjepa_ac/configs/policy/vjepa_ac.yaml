@@ -1,0 +1,45 @@
+# @package _global_
+
+seed: 42
+
+dataset_repo_id: 174-Mate-so101_dataset6
+
+override_dataset_stats:
+  observation.images.top:
+    mean: [[[0.485]], [[0.456]], [[0.406]]]
+    std: [[[0.229]], [[0.224]], [[0.225]]]
+    
+training:
+  offline_steps: 100000
+  batch_size: 256
+  eval_freq: 10000
+  save_freq: 20000
+  log_freq: 100
+  save_checkpoint: true
+
+eval:
+  n_episodes: 50
+  batch_size: 10
+
+policy:
+  name: vjepa_ac
+  model_name: "vjepa2_1_vit_giant_384"
+  repo_id: "facebookresearch/vjepa2"
+  action_dim: 6
+  img_size: 384
+  predictor_embed_dim: 1024
+  mpc_horizon: 15
+  cem_num_samples: 800
+  # We require sequence of states and actions for training
+  # We expect 4 frames in the past
+  n_action_steps: 1
+  n_obs_steps: 4
+
+optimizer:
+  name: adamw
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+
+scheduler:
+  name: cosine
+  warmup_steps: 500
