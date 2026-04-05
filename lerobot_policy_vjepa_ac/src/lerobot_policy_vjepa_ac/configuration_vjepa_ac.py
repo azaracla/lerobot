@@ -30,6 +30,8 @@ class VjepaAcConfig(PreTrainedConfig):
     mlp_ratio: float = 4.0
     num_frames: int = 1
     tubelet_size: int = 1
+    vfps: int = 30  # Original video FPS (LeRobot datasets are typically 30fps)
+    fps: int = 4  # Target FPS for temporal sampling (matching DROID paper)
 
     mpc_horizon: int = 15
     cem_num_samples: int = 800
@@ -52,6 +54,7 @@ class VjepaAcConfig(PreTrainedConfig):
     auto_steps: int = 1
     normalize_reps: bool = False
     use_extrinsics: bool = False
+    use_imagenet_for_visuals: bool = True
 
     augmentation_random_resized_crop_enabled: bool = False
     augmentation_random_resized_crop_scale: float = 1.777
@@ -85,7 +88,29 @@ class VjepaAcConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+        """
+        Returns frame indices for observation frames, sampled at target fps.
+
+        To match DROID paper (4fps, 8 frames), we calculate the frame spacing
+        based on the video fps (vfps) and target fps.
+
+        At vfps=30 with target fps=4: frame_step = 30/4 = 7.5 ≈ 8 frames
+
+        Args:
+            n_obs_steps: Number of observation frames (from base class)
+            vfps: Original video FPS (default: 30, LeRobot datasets)
+            fps: Target FPS for temporal sampling (default: 4, matching DROID)
+
+        Returns:
+            List of frame indices (negative = past frames, 0 = current)
+        """
+        frame_step = round(self.vfps / self.fps)  # e.g., 30/4 = 7.5 → 8
+
+        # Generate indices spaced by frame_step, ending at 0 (current frame)
+        # For n_obs_steps=8, fps=4, vfps=30:
+        # indices = [0, -8, -16, -24, -32, -40, -48, -56]
+        indices = [0] + [-i * frame_step for i in range(1, self.n_obs_steps)]
+        return indices
 
     @property
     def action_delta_indices(self) -> list:

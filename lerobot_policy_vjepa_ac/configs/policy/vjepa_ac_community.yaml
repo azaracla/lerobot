@@ -7,71 +7,56 @@
 
 seed: 42
 
-# Dataset: community_aggregated (128 sub-datasets from HuggingFaceVLA/community_dataset_v1)
-# Aggregated from converted v3.0 sub-datasets
-dataset_repo_id: "local"
-dataset_root: "/mnt/nas/datasets/community_aggregated"
+dataset:
+  repo_id: "azaracla/community_dataset_v1"
 
-# Optimized for NAS (NFS4) performance
 num_workers: 8
-training:
-  offline_steps: 94500  # 315 epochs * 300 IPE (DROID scale)
-  batch_size: 4         # Adjust based on GPU memory
-  eval_freq: 10000
-  save_freq: 20000
-  log_freq: 100
-  save_checkpoint: true
-  prefetch_factor: 2
+batch_size: 4
+steps: 94500
+eval_freq: 10000
+save_freq: 20000
+log_freq: 100
+save_checkpoint: true
 
 eval:
   n_episodes: 50
   batch_size: 4
-  num_workers: 4
 
 policy:
-  name: vjepa_ac
-  model_name: "vjepa2_1_vit_giant_384"  # ViT-Giant (1B params)
-  repo_id: "facebookresearch/vjepa2"
+  type: vjepa_ac
+  model_name: "vjepa2_1_vit_giant_384"
+  encoder_repo_id: "facebookresearch/vjepa2"
   action_dim: 7  # SO-100: 6 joints + gripper
-  img_size: 256  # DROID: 256 (not 384)
+  img_size: 256
   predictor_embed_dim: 1024
   pred_depth: 24
   num_heads: 16
   mpc_horizon: 15
   cem_num_samples: 800
-  n_action_steps: 1
-  n_obs_steps: 4
-  num_frames: 8       # Keep 8 frames
+  num_frames: 8
   tubelet_size: 2
   normalize_reps: true
   auto_steps: 2
   use_extrinsics: false
+  augmentation_random_resized_crop_enabled: true
+  augmentation_random_resized_crop_scale: 1.777
+  augmentation_random_resized_crop_ratio: [0.75, 1.35]
+  augmentation_random_resized_crop_target_size: 256
+  augmentation_horizontal_flip: false
 
 optimizer:
-  name: adamw
-  learning_rate: 4.25e-4  # DROID
-  weight_decay: 0.04       # DROID
+  type: adamw
+  lr: 4.25e-4
+  weight_decay: 0.04
   betas: [0.9, 0.999]
   eps: 1e-8
+  grad_clip_norm: 10.0
 
 scheduler:
-  name: wsd
-  warmup_steps: 4500      # 15 epochs * 300 IPE
-  stable_steps: 85500     # 285 epochs * 300 IPE
-  anneal_steps: 4500      # 15 epochs * 300 IPE
-  start_lr: 7.5e-5        # DROID start_lr
-  final_lr: 0.0           # DROID final_lr
-  peak_lr: 4.25e-4        # DROID peak_lr
-
-# DROID-style augmentation (applied in processor)
-augmentation:
-  random_resized_crop:
-    enabled: true
-    scale: 1.777
-    ratio: [0.75, 1.35]
-    target_size: 256
-  horizontal_flip: false
-  normalize:
-    enabled: true
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
+  type: wsd
+  num_warmup_steps: 4500
+  num_stable_steps: 85500
+  num_anneal_steps: 4500
+  start_lr: 7.5e-5
+  final_lr: 0.0
+  peak_lr: 4.25e-4

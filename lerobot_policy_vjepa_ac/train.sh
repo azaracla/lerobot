@@ -1,0 +1,1 @@
+lerobot-train --config_path=lerobot_policy_vjepa_ac/src/lerobot_policy_vjepa_ac/configs/policy/vjepa_ac.yaml
