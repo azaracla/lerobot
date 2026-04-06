@@ -14,6 +14,9 @@ from .configuration_vjepa_ac import VjepaAcConfig
 from .ac_predictor_utils import VisionTransformerPredictorAC
 
 
+from safetensors.torch import load_file, load_model
+import os
+
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
 
@@ -22,9 +25,26 @@ class VjepaAcPolicy(PreTrainedPolicy):
     name = "vjepa_ac"
     config_class = VjepaAcConfig
 
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file, map_location, strict=True):
+        """Override to clean _orig_mod. prefix from torch.compile keys."""
+        from lerobot.policies.utils import log_model_loading_keys
+
+        state_dict = load_file(model_file)
+        cleaned_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace("predictor._orig_mod.", "predictor.")
+            cleaned_state_dict[new_key] = v
+
+        kwargs = {"strict": False}
+        missing, unexpected = model.load_state_dict(cleaned_state_dict, **kwargs)
+        log_model_loading_keys(missing, unexpected)
+        return model
+
     def __init__(self, config: VjepaAcConfig, dataset_stats=None, **kwargs):
         super().__init__(config)
         self.config = config
+        self.dataset_stats = dataset_stats
 
         # Load the frozen video encoder from PyTorch Hub
         device = getattr(config, "device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -40,10 +60,6 @@ class VjepaAcPolicy(PreTrainedPolicy):
         self.encoder.eval()
         for param in self.encoder.parameters():
             param.requires_grad = False
-
-        # Convert frozen encoder to BFloat16 for speed and memory
-        if device == "cuda":
-            self.encoder.bfloat16()
 
         # Initialize the Action-Conditioned Predictor
         max_seq_len = max(config.num_frames, config.mpc_horizon + 1)
@@ -62,12 +78,8 @@ class VjepaAcPolicy(PreTrainedPolicy):
             mlp_ratio=config.mlp_ratio,
         ).to(device)
 
-        # Optimize the trainable predictor with torch.compile
-        if hasattr(torch, "compile"):
-            try:
-                self.predictor = torch.compile(self.predictor)
-            except Exception as e:
-                print(f"Warning: torch.compile failed: {e}")
+        # Disable torch.compile for inference to avoid shape issues with CEM
+        # torch.compile is only useful for training speed, not needed for inference
 
         # Pre-encode goal image if provided
         self.goal_latent = None
@@ -96,23 +108,45 @@ class VjepaAcPolicy(PreTrainedPolicy):
         if not getattr(self.config, "use_imagenet_for_visuals", True):
             return images
 
-        mean = IMAGENET_MEAN.to(images.device).view(1, -1, 1, 1, 1)
-        std = IMAGEN_STD.to(images.device).view(1, -1, 1, 1, 1)
+        mean = IMAGENET_MEAN.to(images.device, non_blocking=True).view(1, -1, 1, 1, 1).to(images.dtype)
+        std = IMAGENET_STD.to(images.device, non_blocking=True).view(1, -1, 1, 1, 1).to(images.dtype)
         return (images - mean) / std
 
     def _encode_goal_image(self, path: str) -> torch.Tensor:
         """Load and encode a goal image once at init time."""
         img = PIL.Image.open(path).convert("RGB")
-        img = np.array(img) / 255.0
+        img = img.resize((self.config.img_size, self.config.img_size), PIL.Image.BILINEAR)
+        img = np.array(img, dtype=np.float32) / 255.0
         img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
         device = next(self.encoder.parameters()).device
-        img = img.to(device)
+        img = img.to(device, non_blocking=True)
         img = self._imagenet_normalize(img)
         with torch.no_grad():
             latent = self.encoder(img)
         if getattr(self.config, "normalize_reps", False):
             latent = torch.nn.functional.layer_norm(latent, (latent.size(-1),))
         return latent
+
+    def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Normalize state using MIN_MAX normalization to match training."""
+        if self.dataset_stats is None:
+            return state  # No normalization if no stats available
+
+        obs_state = self.dataset_stats.get("observation.state", {})
+        if not obs_state:
+            return state
+
+        state_min = torch.as_tensor(obs_state.get("min", None), device=state.device, dtype=state.dtype)
+        state_max = torch.as_tensor(obs_state.get("max", None), device=state.device, dtype=state.dtype)
+
+        if state_min is None or state_max is None:
+            return state
+
+        # MIN_MAX normalization: map [min, max] to [-1, 1]
+        denom = state_max - state_min
+        eps = 1e-8
+        denom = torch.where(denom == 0, torch.tensor(eps, device=state.device), denom)
+        return 2 * (state - state_min) / denom - 1
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
@@ -125,8 +159,8 @@ class VjepaAcPolicy(PreTrainedPolicy):
         Model Predictive Control using Cross-Entropy Method (CEM).
         Encodes the current image and searches for the best action sequence.
 
-        NOTE: This policy outputs absolute joint positions (not deltas),
-        consistent with the SO-101 training data format.
+        NOTE: This policy outputs normalized actions (MIN_MAX). The postprocessor
+        will denormalize them to absolute joint positions for the robot.
         """
         image_key = next(
             (k for k in batch if k.startswith("observation.image") and batch[k].ndim >= 4),
@@ -146,6 +180,19 @@ class VjepaAcPolicy(PreTrainedPolicy):
                 img_seq = images[:, :, -1:]
             else:
                 img_seq = images.unsqueeze(2)
+
+            # Resize to match encoder's expected size (img_size x img_size)
+            # This fixes mismatch when robot sends different resolution images
+            _, C, T, H, W = img_seq.shape
+            if H != self.config.img_size or W != self.config.img_size:
+                img_seq = torch.nn.functional.interpolate(
+                    img_seq.view(B * T, C, H, W),
+                    size=(self.config.img_size, self.config.img_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                img_seq = img_seq.view(B, C, T, self.config.img_size, self.config.img_size)
+
             img_seq = self._imagenet_normalize(img_seq)
             current_latent = self.encoder(img_seq)
 
@@ -160,7 +207,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
         momentum_mean = getattr(self.config, "cem_momentum_mean", 0.25)
         momentum_std = getattr(self.config, "cem_momentum_std", 0.95)
 
-        best_first_actions = []
+        best_trajectories = []
 
         for b in range(B):
             c_latent = current_latent[b : b + 1]
@@ -172,6 +219,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
                 init_state = init_state[:, -1]
             elif init_state.ndim == 1:
                 init_state = init_state.unsqueeze(0)
+
+            # Normalize state for CEM to match training (MIN_MAX normalization)
+            # The predictor was trained with normalized states, so inference must match
+            init_state = self._normalize_state(init_state)
 
             mu = init_state.clone().expand(H, -1)
             std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
@@ -213,9 +264,11 @@ class VjepaAcPolicy(PreTrainedPolicy):
                 mu = new_mu * (1.0 - momentum_mean) + mu * momentum_mean
                 std = new_std * (1.0 - momentum_std) + std * momentum_std
 
-            best_first_actions.append(mu[0])
+            best_trajectories.append(mu)
 
-        return torch.stack(best_first_actions)
+        torch.cuda.empty_cache()
+
+        return torch.stack(best_trajectories)
 
     def forward(
         self,

@@ -49,6 +49,9 @@ from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
+
+import lerobot_policy_vjepa_ac  # noqa: F401 - ensure plugin is registered
+
 from .helpers import (
     FPSTracker,
     Observation,
@@ -95,6 +98,35 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     @property
     def policy_image_features(self):
         return self.policy.config.image_features
+
+    def _load_dataset_stats(self, pretrained_path: str) -> dict | None:
+        """Load dataset statistics from the preprocessor's normalizer step."""
+        import torch
+        from pathlib import Path
+        from safetensors.torch import load_file
+
+        stats_file = Path(pretrained_path) / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+        if not stats_file.exists():
+            self.logger.warning(f"Dataset stats file not found: {stats_file}")
+            return None
+
+        try:
+            state = load_file(str(stats_file))
+            # Convert from flat format (e.g., "observation.state.min") to nested dict
+            stats = {}
+            for key, tensor in state.items():
+                parts = key.split(".")
+                d = stats
+                for part in parts[:-1]:
+                    if part not in d:
+                        d[part] = {}
+                    d = d[part]
+                d[parts[-1]] = tensor.tolist() if tensor.numel() > 1 else tensor.item()
+            self.logger.info(f"Loaded dataset stats: {list(stats.keys())}")
+            return stats
+        except Exception as e:
+            self.logger.warning(f"Failed to load dataset stats: {e}")
+            return None
 
     def _reset_server(self) -> None:
         """Flushes server state when new client connects."""
@@ -149,7 +181,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+
+        # Load dataset stats from preprocessor for policies that need them (e.g., VJEPA-AC)
+        dataset_stats = self._load_dataset_stats(policy_specs.pretrained_name_or_path)
+
+        self.policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path,
+            dataset_stats=dataset_stats,
+        )
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device

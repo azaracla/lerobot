@@ -419,7 +419,7 @@ class RobotClient:
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
                 observation=raw_observation,
-                timestep=max(latest_action, 0),
+                timestep=latest_action + 1,  # Increment timestep after action execution
             )
 
             obs_capture_time = time.perf_counter() - start_time

@@ -36,3 +36,27 @@ Plus simple que de passer le goal image via le batch lerobot. Le goal image est 
 
 ### Raison
 Le module `async_inference/` de lerobot existe déjà et est complet (gRPC, action chunking, queue management, must-go mechanism). VJEPA-AC s'intègre naturellement car il implémente déjà `predict_action_chunk` correctement.
+
+## 2026-04-06 : Normalisation du state dans select_action
+
+### Problème
+Le CEM utilisait le state brut (positions absolues du robot) pour initialiser `mu`, alors que l'entraînement utilisait des states normalisés. Le predictor a été entraîné avec:
+- States normalisés (MIN_MAX)
+- Actions normalisées (MIN_MAX)
+
+Mais l'inférence passait des states absolus → mismatch de distribution.
+
+### Décision
+- Stocker `dataset_stats` dans la policy (`self.dataset_stats = dataset_stats`)
+- Ajouter méthode `_normalize_state()` qui applique MIN_MAX normalization
+- Appeler `_normalize_state(init_state)` avant d'initialiser `mu` dans la boucle CEM
+- Policy outputs normalized actions → postprocessor denormalizes them
+
+### Implémentation
+1. `__init__`: `self.dataset_stats = dataset_stats`
+2. `_normalize_state()`: convertit [min,max] → [-1,1] selon les stats
+3. `select_action`: `init_state = self._normalize_state(init_state)`
+4. `policy_server.py`: `_load_dataset_stats()` charge les stats depuis le fichier safetensors
+
+### Raison
+Le predictor a appris à prédire les latents à partir de states/actions normalisés. Pour que les prédictions soient valides, les entrées doivent être dans la même distribution (normalisée).

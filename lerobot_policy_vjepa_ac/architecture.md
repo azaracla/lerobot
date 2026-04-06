@@ -49,7 +49,7 @@ Policy goal-conditionée utilisant un world model VJEPA2 pour la planification d
 | `processor_vjepa_ac.py` | Pre/post processors (normalisation, device) |
 | `transforms.py` | Augmentations d'images |
 
-## Commande lerobot-record
+## Commande lerobot-record (synchrone)
 
 ```bash
 lerobot-record \
@@ -59,7 +59,53 @@ lerobot-record \
   --robot.id=black \
   --dataset.repo_id=azaracla/eval_vjepa_ac_test \
   --dataset.single_task="Pick up the object" \
-  --dataset.num_episodes=5 \
   --policy.path=outputs/vjepa_ac/run_20260406_overfit_4/checkpoints/last \
   --policy.goal_image_path=/chemin/vers/goal_image.png
 ```
+
+## Inférence asynchrone (gRPC)
+
+### Architecture
+```
+[PolicyServer] (GPU server)          [RobotClient] (edge + SO-101)
+       |                                      |
+  charge vjepa_ac policy                connecté au robot
+  reçoit observations                   envoie observations
+  CEM → action chunks                   reçoit/prioritise actions
+       |                                      |
+  gRPC (pickle)  <───────────────────────────>
+```
+
+### Commandes
+
+**Server (GPU) :**
+```bash
+python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 --port=8080 --fps=30
+```
+
+**Client (robot) :**
+```bash
+python -m lerobot.async_inference.robot_client \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.cameras='{"top": {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30}}' \
+  --robot.id=orange \
+  --task="Place the scotch in the box" \
+  --server_address=192.168.1.100:8080 \
+  --policy_type=vjepa_ac \
+  --pretrained_name_or_path=outputs/vjepa_ac/run_20260406_overfit_4/checkpoints/last \
+  --policy_device=cuda \
+  --client_device=cpu \
+  --actions_per_chunk=15 \
+  --chunk_size_threshold=0.5 \
+  --aggregate_fn_name=weighted_average
+```
+
+### Comment ça marche
+1. Le client se connecte via gRPC et envoie la config de la policy
+2. Le server charge le checkpoint et les preprocess/postprocess processors
+3. Boucle :
+   - Client : capture obs → envoie au server → reçoit actions → execute sur robot
+   - Server : reçoit obs → preprocess → CEM → predict_action_chunk → postprocess → retourne actions
+4. Action chunking : le server prédit N actions, le client gère une queue avec priorité
