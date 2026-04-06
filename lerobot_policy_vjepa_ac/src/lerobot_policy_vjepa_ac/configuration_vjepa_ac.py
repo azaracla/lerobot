@@ -33,9 +33,9 @@ class VjepaAcConfig(PreTrainedConfig):
     vfps: int = 30  # Original video FPS (LeRobot datasets are typically 30fps)
     fps: int = 4  # Target FPS for temporal sampling (matching DROID paper)
 
-    mpc_horizon: int = 15
-    cem_num_samples: int = 800
-    cem_num_iters: int = 5
+    mpc_horizon: int = 1
+    cem_num_samples: int = 200  # paper uses 800 on 4090 24GB; reduce if OOM on 16GB
+    cem_num_iters: int = 10
     cem_elite_ratio: float = 0.1
     cem_std: float = 0.5
     cem_momentum_mean: float = 0.25

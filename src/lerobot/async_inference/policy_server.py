@@ -409,9 +409,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Process each action in the chunk
         processed_actions = []
         for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
             single_action = action_tensor[:, i, :]
             processed_action = self.postprocessor(single_action)
+            if i == 0:
+                self.logger.info(
+                    f"Postprocessor input shape: {single_action.shape}, output shape: {processed_action.shape}"
+                )
             processed_actions.append(processed_action)
 
         # Stack back to (B, chunk_size, action_dim), then remove batch dim

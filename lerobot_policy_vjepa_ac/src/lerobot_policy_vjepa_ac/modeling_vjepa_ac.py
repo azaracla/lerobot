@@ -39,6 +39,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
         kwargs = {"strict": False}
         missing, unexpected = model.load_state_dict(cleaned_state_dict, **kwargs)
         log_model_loading_keys(missing, unexpected)
+        model.predictor = torch.compile(model.predictor, mode="reduce-overhead")
         return model
 
     def __init__(self, config: VjepaAcConfig, dataset_stats=None, **kwargs):
@@ -76,15 +77,23 @@ class VjepaAcPolicy(PreTrainedPolicy):
             depth=config.pred_depth,
             num_heads=config.num_heads,
             mlp_ratio=config.mlp_ratio,
-        ).to(device)
-
-        # Disable torch.compile for inference to avoid shape issues with CEM
-        # torch.compile is only useful for training speed, not needed for inference
+        ).to(device, dtype=torch.bfloat16)
 
         # Pre-encode goal image if provided
         self.goal_latent = None
         if config.goal_image_path:
-            self.goal_latent = self._encode_goal_image(config.goal_image_path)
+            import os
+
+            goal_path = config.goal_image_path
+            if not os.path.exists(goal_path):
+                goal_path = os.path.join(os.path.dirname(__file__), config.goal_image_path)
+            if os.path.exists(goal_path):
+                self.goal_latent = self._encode_goal_image(goal_path)
+                print(
+                    f"[VJEPA_AC] Loaded goal image from {goal_path}, latent shape: {self.goal_latent.shape}"
+                )
+            else:
+                print(f"[VJEPA_AC] WARNING: Goal image not found at {goal_path} or {config.goal_image_path}")
 
     # --- Required abstract method implementations ---
 
@@ -130,7 +139,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
     def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
         """Normalize state using MIN_MAX normalization to match training."""
         if self.dataset_stats is None:
-            return state  # No normalization if no stats available
+            return state
 
         obs_state = self.dataset_stats.get("observation.state", {})
         if not obs_state:
@@ -142,7 +151,6 @@ class VjepaAcPolicy(PreTrainedPolicy):
         if state_min is None or state_max is None:
             return state
 
-        # MIN_MAX normalization: map [min, max] to [-1, 1]
         denom = state_max - state_min
         eps = 1e-8
         denom = torch.where(denom == 0, torch.tensor(eps, device=state.device), denom)
@@ -159,8 +167,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
         Model Predictive Control using Cross-Entropy Method (CEM).
         Encodes the current image and searches for the best action sequence.
 
-        NOTE: This policy outputs normalized actions (MIN_MAX). The postprocessor
-        will denormalize them to absolute joint positions for the robot.
+        Matches VJEPA2 original CEM from mpc_utils.py and world_model_wrapper.py.
         """
         image_key = next(
             (k for k in batch if k.startswith("observation.image") and batch[k].ndim >= 4),
@@ -176,99 +183,107 @@ class VjepaAcPolicy(PreTrainedPolicy):
         device = images.device
 
         with torch.no_grad():
+            # images: [B, C, T, H, W] (ndim=5) or [B, C, H, W] (ndim=4)
             if images.ndim == 5:
-                img_seq = images[:, :, -1:]
+                img_seq = images  # [B, C, T_obs, H, W]
             else:
-                img_seq = images.unsqueeze(2)
+                img_seq = images.unsqueeze(2)  # [B, C, 1, H, W]
 
-            # Resize to match encoder's expected size (img_size x img_size)
-            # This fixes mismatch when robot sends different resolution images
-            _, C, T, H, W = img_seq.shape
-            if H != self.config.img_size or W != self.config.img_size:
+            B_s, C, T_obs, H_img, W_img = img_seq.shape
+
+            if H_img != self.config.img_size or W_img != self.config.img_size:
                 img_seq = torch.nn.functional.interpolate(
-                    img_seq.view(B * T, C, H, W),
+                    img_seq.view(B_s * T_obs, C, H_img, W_img),
                     size=(self.config.img_size, self.config.img_size),
                     mode="bilinear",
                     align_corners=False,
-                )
-                img_seq = img_seq.view(B, C, T, self.config.img_size, self.config.img_size)
+                ).view(B_s, C, T_obs, self.config.img_size, self.config.img_size)
 
             img_seq = self._imagenet_normalize(img_seq)
-            current_latent = self.encoder(img_seq)
+
+            # Encode each frame independently: [B*T_obs, C, 1, H, W] → [B*T_obs, tokens, D]
+            img_flat = img_seq.permute(0, 2, 1, 3, 4).reshape(
+                B_s * T_obs, C, 1, self.config.img_size, self.config.img_size
+            )
+            with torch.amp.autocast("cuda", enabled=img_flat.is_cuda, dtype=torch.bfloat16):
+                latents_flat = self.encoder(img_flat)  # [B*T_obs, tokens, D]
+            latents_flat = latents_flat.to(torch.float32)
+            tokens_per_frame = latents_flat.size(1)
+            D = latents_flat.size(-1)
+
+            # Full multi-frame context: [B, T_obs*tokens, D]
+            context_latent = latents_flat.view(B_s, T_obs, tokens_per_frame, D).flatten(1, 2)
 
         goal_latent = self.goal_latent
         if goal_latent is None:
-            goal_latent = torch.zeros(B, current_latent.size(1), current_latent.size(-1), device=device)
+            raise RuntimeError(
+                "goal_latent is None: encode a goal image with set_goal() before calling select_action."
+            )
+
+        # Historical actions from state differences (Droid convention: a_t = s_{t+1} - s_t)
+        # states: [B, T_obs, state_dim] or [B, state_dim]
+        if states.ndim == 3:
+            hist_states = self._normalize_state(states)       # [B, T_obs, state_dim]
+            hist_actions = states[:, 1:] - states[:, :-1]    # [B, T_obs-1, action_dim]
+        else:
+            hist_states = self._normalize_state(states).unsqueeze(1)
+            hist_actions = torch.zeros(B, 0, self.config.action_dim, device=device)
 
         N = self.config.cem_num_samples
         H = self.config.mpc_horizon
         top_k = max(2, int(N * self.config.cem_elite_ratio))
-
+        loss_exp = getattr(self.config, "loss_exp", 1.0)
         momentum_mean = getattr(self.config, "cem_momentum_mean", 0.25)
         momentum_std = getattr(self.config, "cem_momentum_std", 0.95)
+        normalize_reps = getattr(self.config, "normalize_reps", False)
 
-        best_trajectories = []
+        # B=1 in robot inference — process batch dim directly without loop
+        c_lat = context_latent  # [B, T_obs*tokens, D]
+        if normalize_reps:
+            c_lat = torch.nn.functional.layer_norm(c_lat, (D,))
 
-        for b in range(B):
-            c_latent = current_latent[b : b + 1]
-            if getattr(self.config, "normalize_reps", False):
-                c_latent = torch.nn.functional.layer_norm(c_latent, (c_latent.size(-1),))
+        # Expand to N samples (assumes B=1; for B>1 this takes first element)
+        c_lat_N = c_lat[0:1].expand(N, -1, -1)           # [N, T_obs*tokens, D]
+        h_act_N = hist_actions[0:1].expand(N, -1, -1)    # [N, T_obs-1, action_dim]
+        s_traj0 = hist_states[0:1].expand(N, -1, -1)     # [N, T_obs, state_dim]
+        g_lat = goal_latent[0:1].expand(N, -1, -1)       # [N, tokens, D]
 
-            init_state = states[b : b + 1]
-            if init_state.ndim == 3:
-                init_state = init_state[:, -1]
-            elif init_state.ndim == 1:
-                init_state = init_state.unsqueeze(0)
+        mu = torch.zeros(H, self.config.action_dim, device=device)
+        std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
 
-            # Normalize state for CEM to match training (MIN_MAX normalization)
-            # The predictor was trained with normalized states, so inference must match
-            init_state = self._normalize_state(init_state)
+        for _ in range(self.config.cem_num_iters):
+            actions = mu.unsqueeze(0) + std.unsqueeze(0) * torch.randn(N, H, self.config.action_dim, device=device)
 
-            mu = init_state.clone().expand(H, -1)
-            std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
+            # Step 0: full T_obs-frame context (matches training), causal attention active
+            a_traj0 = torch.cat([h_act_N, actions[:, :1]], dim=1)  # [N, T_obs, action_dim]
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                pred0 = self.predictor(c_lat_N, a_traj0, s_traj0)
+            current_z = pred0[:, -tokens_per_frame:].to(torch.float32)
+            if normalize_reps:
+                current_z = torch.nn.functional.layer_norm(current_z, (D,))
 
-            tokens_per_frame = c_latent.size(1)
+            # Steps 1..H-1: rolling T=1 context (FlashAttention active)
+            _s = actions[:, :1]
+            for h in range(1, H):
+                _a = actions[:, h : h + 1]
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    pred_h = self.predictor(current_z, _a, _s)
+                current_z = pred_h[:, -tokens_per_frame:].to(torch.float32)
+                if normalize_reps:
+                    current_z = torch.nn.functional.layer_norm(current_z, (D,))
+                _s = _a
 
-            for _ in range(self.config.cem_num_iters):
-                eps = torch.randn(N, H, self.config.action_dim, device=device)
-                actions = mu.unsqueeze(0) + std.unsqueeze(0) * eps
+            costs = torch.mean(torch.abs(current_z - g_lat) ** loss_exp, dim=(1, 2))
+            _, elite_inds = torch.topk(costs, top_k, largest=False)
+            elites = actions[elite_inds]
 
-                actions[..., -1:] = torch.clamp(actions[..., -1:], 0.0, 1.0)
+            new_mu = elites.mean(dim=0)
+            new_std = elites.std(dim=0) + 1e-5
+            mu = new_mu * (1.0 - momentum_mean) + mu * momentum_mean
+            std = new_std * (1.0 - momentum_std) + std * momentum_std
 
-                z = c_latent.expand(N, -1, -1)
-
-                for h_step in range(H):
-                    _a = actions[:, : h_step + 1]
-                    _s_seq = actions[:, : h_step + 1]
-
-                    pred = self.predictor(z, _a, _s_seq)
-                    if getattr(self.config, "normalize_reps", False):
-                        pred = torch.nn.functional.layer_norm(pred, (pred.size(-1),))
-
-                    if h_step < H - 1:
-                        z = torch.cat([z, pred[:, -tokens_per_frame:]], dim=1)
-                    else:
-                        final_latent = pred[:, -tokens_per_frame:]
-
-                g_lat = goal_latent[b : b + 1].expand(N, -1, -1)
-                costs = torch.mean(
-                    torch.abs(final_latent - g_lat) ** getattr(self.config, "loss_exp", 1.0), dim=(1, 2)
-                )
-
-                _, elite_inds = torch.topk(costs, top_k, largest=False)
-                elites = actions[elite_inds]
-
-                new_mu = elites.mean(dim=0)
-                new_std = elites.std(dim=0) + 1e-5
-
-                mu = new_mu * (1.0 - momentum_mean) + mu * momentum_mean
-                std = new_std * (1.0 - momentum_std) + std * momentum_std
-
-            best_trajectories.append(mu)
-
-        torch.cuda.empty_cache()
-
-        return torch.stack(best_trajectories)
+        # Return [B, H, action_dim] — mu is the best action trajectory
+        return mu.unsqueeze(0).expand(B, -1, -1)
 
     def forward(
         self,

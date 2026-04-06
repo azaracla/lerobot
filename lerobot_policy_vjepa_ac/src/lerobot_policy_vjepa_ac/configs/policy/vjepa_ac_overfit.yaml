@@ -48,9 +48,9 @@ policy:
   num_heads: 8
   
   use_amp: true
-  mpc_horizon: 15
-  cem_num_samples: 50
-  cem_num_iters: 2
+  mpc_horizon: 5
+  cem_num_samples: 100
+  cem_num_iters: 10
 
 optimizer:
   type: adamw
