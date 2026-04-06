@@ -1,0 +1,57 @@
+# @package _global_
+
+# Test d'overfitting : Valider la tuyauterie sur un seul épisode avec un petit modèle
+seed: 42
+output_dir: outputs/vjepa_ac/overfit_test
+
+dataset:
+  repo_id: azaracla/community_dataset_v1_aggregated
+  episodes: [0]  # On ne prend QUE le premier épisode
+  streaming: true
+  video_keys: ["observation.images.image"]
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    tfs:
+      droid_random_resized_crop:
+        type: DroidRandomResizedCrop
+        kwargs:
+          target_size: 384
+
+batch_size: 2
+num_workers: 0  # Plus simple pour le debug
+steps: 2000     # 2000 steps suffisent largement pour overfitter un épisode
+tolerance_s: 1e-3
+use_policy_training_preset: false
+
+policy:
+  type: vjepa_ac
+  model_name: "vjepa2_1_vit_giant_384"
+  encoder_repo_id: "facebookresearch/vjepa2"
+  action_dim: 6
+  img_size: 384
+  num_frames: 4
+  n_obs_steps: 4
+  
+  # MODELE RÉDUIT pour le test
+  predictor_embed_dim: 256
+  pred_depth: 4
+  num_heads: 4
+  
+  use_amp: true
+  mpc_horizon: 15
+  cem_num_samples: 50
+  cem_num_iters: 2
+
+optimizer:
+  type: adamw
+  lr: 1e-4  # On augmente un peu le LR pour que ça "colle" vite
+  weight_decay: 0.01
+
+scheduler:
+  type: diffuser
+  name: cosine
+  num_warmup_steps: 100
+
+wandb:
+  enable: false  # Pas besoin pour un test de 5 min

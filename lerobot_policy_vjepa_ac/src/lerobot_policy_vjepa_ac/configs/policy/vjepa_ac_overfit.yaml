@@ -1,0 +1,66 @@
+# @package _global_
+
+seed: 42
+output_dir: outputs/vjepa_ac/run_20260406_overfit_4
+
+dataset:
+  repo_id: azaracla/so101_pickup
+  #episodes: [0]
+  revision: main
+  streaming: false
+  image_transforms:
+    enable: true
+    max_num_transforms: 1
+    random_order: false
+    tfs:
+      droid_random_resized_crop:
+        type: DroidRandomResizedCrop
+        weight: 1.0
+        kwargs:
+          scale: 1.777
+          ratio: [0.75, 1.35]
+          target_size: 384
+
+batch_size: 16
+num_workers: 8
+steps: 3000
+tolerance_s: 1e-3
+rename_map:
+  "observation.images.top": "observation.images.image"
+eval_freq: 500
+save_freq: 500
+log_freq: 50
+use_policy_training_preset: false
+save_checkpoint: true
+
+policy:
+  type: vjepa_ac
+  model_name: "vjepa2_1_vit_giant_384"
+  encoder_repo_id: "facebookresearch/vjepa2"
+  action_dim: 6
+  img_size: 384
+  num_frames: 4
+  n_obs_steps: 4
+  
+  # MODÈLE RÉDUIT pour que l'overfit soit quasi-instantané
+  predictor_embed_dim: 512
+  pred_depth: 8
+  num_heads: 8
+  
+  use_amp: true
+  mpc_horizon: 15
+  cem_num_samples: 50
+  cem_num_iters: 2
+
+optimizer:
+  type: adamw
+  lr: 1e-4
+  weight_decay: 0.01
+
+scheduler:
+  type: diffuser
+  name: cosine
+  num_warmup_steps: 100
+
+wandb:
+  enable: true

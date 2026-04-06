@@ -179,6 +179,5 @@ outputs/
 *.part
 
 # V-Jepa 2 code
-vjepa2/*
 
 my_datasets/

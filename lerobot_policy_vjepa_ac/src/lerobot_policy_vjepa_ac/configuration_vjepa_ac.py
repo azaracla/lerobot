@@ -55,12 +55,18 @@ class VjepaAcConfig(PreTrainedConfig):
     normalize_reps: bool = False
     use_extrinsics: bool = False
     use_imagenet_for_visuals: bool = True
+    goal_image_path: str | None = None
 
     augmentation_random_resized_crop_enabled: bool = False
     augmentation_random_resized_crop_scale: float = 1.777
     augmentation_random_resized_crop_ratio: tuple[float, float] = (0.75, 1.35)
     augmentation_random_resized_crop_target_size: int = 256
     augmentation_horizontal_flip: bool = False
+
+    log_observation_images: bool = False
+    log_observation_frequency: int = 100
+    save_images_to_disk: bool = False
+    save_images_dir: str = "outputs/debug_images"
 
     def __post_init__(self):
         super().__post_init__()
@@ -90,26 +96,16 @@ class VjepaAcConfig(PreTrainedConfig):
     def observation_delta_indices(self) -> list:
         """
         Returns frame indices for observation frames, sampled at target fps.
-
-        To match DROID paper (4fps, 8 frames), we calculate the frame spacing
-        based on the video fps (vfps) and target fps.
-
-        At vfps=30 with target fps=4: frame_step = 30/4 = 7.5 ≈ 8 frames
-
-        Args:
-            n_obs_steps: Number of observation frames (from base class)
-            vfps: Original video FPS (default: 30, LeRobot datasets)
-            fps: Target FPS for temporal sampling (default: 4, matching DROID)
-
-        Returns:
-            List of frame indices (negative = past frames, 0 = current)
+        Sorted in ascending order (past to present).
         """
-        frame_step = round(self.vfps / self.fps)  # e.g., 30/4 = 7.5 → 8
+        # Fallback to 1 if vfps/fps calculation is problematic
+        step = max(1, round(self.vfps / self.fps))
 
-        # Generate indices spaced by frame_step, ending at 0 (current frame)
-        # For n_obs_steps=8, fps=4, vfps=30:
-        # indices = [0, -8, -16, -24, -32, -40, -48, -56]
-        indices = [0] + [-i * frame_step for i in range(1, self.n_obs_steps)]
+        # Current frame is 0. We want n_obs_steps total frames.
+        # Example for n=8, step=8: [-56, -48, -40, -32, -24, -16, -8, 0]
+        indices = []
+        for i in range(self.n_obs_steps):
+            indices.append(-(self.n_obs_steps - 1 - i) * step)
         return indices
 
     @property

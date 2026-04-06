@@ -34,6 +34,7 @@ from lerobot.policies import (  # noqa: F401
     SmolVLAConfig,
     VQBeTConfig,
 )
+from lerobot_policy_vjepa_ac import VjepaAcConfig  # noqa: F401
 from lerobot.robots.robot import Robot
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_STR
 from lerobot.utils.utils import init_logging

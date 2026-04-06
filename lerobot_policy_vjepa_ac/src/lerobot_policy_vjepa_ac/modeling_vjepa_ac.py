@@ -5,6 +5,8 @@ Consolidate into LeRobot PretrainedPolicy class:
 - VJepa AC inference: vjepa2/notebooks/utils/mpc_utils.py & world_model_wrapper.py
 """
 
+import numpy as np
+import PIL.Image
 import torch
 import torch.nn as nn
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -26,6 +28,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
 
         # Load the frozen video encoder from PyTorch Hub
         device = getattr(config, "device", "cuda" if torch.cuda.is_available() else "cpu")
+
         with torch.device(device):
             encoder_output = torch.hub.load(config.encoder_repo_id, config.model_name)
 
@@ -37,6 +40,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
         self.encoder.eval()
         for param in self.encoder.parameters():
             param.requires_grad = False
+
+        # Convert frozen encoder to BFloat16 for speed and memory
+        if device == "cuda":
+            self.encoder.bfloat16()
 
         # Initialize the Action-Conditioned Predictor
         max_seq_len = max(config.num_frames, config.mpc_horizon + 1)
@@ -54,6 +61,18 @@ class VjepaAcPolicy(PreTrainedPolicy):
             num_heads=config.num_heads,
             mlp_ratio=config.mlp_ratio,
         ).to(device)
+
+        # Optimize the trainable predictor with torch.compile
+        if hasattr(torch, "compile"):
+            try:
+                self.predictor = torch.compile(self.predictor)
+            except Exception as e:
+                print(f"Warning: torch.compile failed: {e}")
+
+        # Pre-encode goal image if provided
+        self.goal_latent = None
+        if config.goal_image_path:
+            self.goal_latent = self._encode_goal_image(config.goal_image_path)
 
     # --- Required abstract method implementations ---
 
@@ -78,8 +97,22 @@ class VjepaAcPolicy(PreTrainedPolicy):
             return images
 
         mean = IMAGENET_MEAN.to(images.device).view(1, -1, 1, 1, 1)
-        std = IMAGENET_STD.to(images.device).view(1, -1, 1, 1, 1)
+        std = IMAGEN_STD.to(images.device).view(1, -1, 1, 1, 1)
         return (images - mean) / std
+
+    def _encode_goal_image(self, path: str) -> torch.Tensor:
+        """Load and encode a goal image once at init time."""
+        img = PIL.Image.open(path).convert("RGB")
+        img = np.array(img) / 255.0
+        img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+        device = next(self.encoder.parameters()).device
+        img = img.to(device)
+        img = self._imagenet_normalize(img)
+        with torch.no_grad():
+            latent = self.encoder(img)
+        if getattr(self.config, "normalize_reps", False):
+            latent = torch.nn.functional.layer_norm(latent, (latent.size(-1),))
+        return latent
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
@@ -91,8 +124,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
         """
         Model Predictive Control using Cross-Entropy Method (CEM).
         Encodes the current image and searches for the best action sequence.
+
+        NOTE: This policy outputs absolute joint positions (not deltas),
+        consistent with the SO-101 training data format.
         """
-        # Find the observation image key dynamically
         image_key = next(
             (k for k in batch if k.startswith("observation.image") and batch[k].ndim >= 4),
             None,
@@ -100,8 +135,8 @@ class VjepaAcPolicy(PreTrainedPolicy):
         if image_key is None:
             raise KeyError("No observation.image* key found in batch")
 
-        images = batch[image_key]  # [B, C, T, H, W] or [B, C, H, W]
-        states = batch["observation.state"]  # [B, T, D] or [B, D]
+        images = batch[image_key]
+        states = batch["observation.state"]
 
         B = images.size(0)
         device = images.device
@@ -112,99 +147,66 @@ class VjepaAcPolicy(PreTrainedPolicy):
             else:
                 img_seq = images.unsqueeze(2)
             img_seq = self._imagenet_normalize(img_seq)
-            current_latent = self.encoder(img_seq)  # [B, N_patches, D]
+            current_latent = self.encoder(img_seq)
 
-        # Extract goal image if present (fallback to dummy zeros if not goal-conditioned)
-        goal_key = next((k for k in batch if "goal" in k and "image" in k), None)
-        with torch.no_grad():
-            if goal_key is not None:
-                goal_img = batch[goal_key].unsqueeze(2) if batch[goal_key].ndim == 4 else batch[goal_key]
-                goal_img = self._imagenet_normalize(goal_img)
-                goal_latent = self.encoder(goal_img)  # [B, N, D]
-            else:
-                goal_latent = torch.zeros(B, current_latent.size(1), current_latent.size(-1), device=device)
+        goal_latent = self.goal_latent
+        if goal_latent is None:
+            goal_latent = torch.zeros(B, current_latent.size(1), current_latent.size(-1), device=device)
 
-            if getattr(self.config, "normalize_reps", False):
-                goal_latent = torch.nn.functional.layer_norm(goal_latent, (goal_latent.size(-1),))
-
-        # CEM parameters from config
         N = self.config.cem_num_samples
         H = self.config.mpc_horizon
-        top_k = max(2, int(N * self.config.cem_elite_ratio))  # ensure at least 2 for std
+        top_k = max(2, int(N * self.config.cem_elite_ratio))
 
         momentum_mean = getattr(self.config, "cem_momentum_mean", 0.25)
         momentum_std = getattr(self.config, "cem_momentum_std", 0.95)
-        maxnorm = getattr(self.config, "cem_maxnorm", 0.05)
 
         best_first_actions = []
 
         for b in range(B):
-            # mu and std for action trajectory [H, action_dim]
-            mu = torch.zeros(H, self.config.action_dim, device=device)
-            std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
-
-            c_latent = current_latent[b : b + 1]  # [1, N_patches, D]
+            c_latent = current_latent[b : b + 1]
             if getattr(self.config, "normalize_reps", False):
                 c_latent = torch.nn.functional.layer_norm(c_latent, (c_latent.size(-1),))
 
-            init_state = states[b : b + 1]  # [1, T, D] or [1, D]
+            init_state = states[b : b + 1]
             if init_state.ndim == 3:
-                init_state = init_state[:, -1]  # [1, D]
+                init_state = init_state[:, -1]
             elif init_state.ndim == 1:
                 init_state = init_state.unsqueeze(0)
+
+            mu = init_state.clone().expand(H, -1)
+            std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
 
             tokens_per_frame = c_latent.size(1)
 
             for _ in range(self.config.cem_num_iters):
-                # 1. Sample trajectories: [N, H, action_dim]
-                # actions are deltas in vjepa
                 eps = torch.randn(N, H, self.config.action_dim, device=device)
                 actions = mu.unsqueeze(0) + std.unsqueeze(0) * eps
 
-                # 2. Clip actions (vjepa style)
-                actions[..., :3] = torch.clamp(actions[..., :3], -maxnorm, maxnorm)
-                # Gripper clip (vjepa uses -0.75 to 0.75)
-                actions[..., -1:] = torch.clamp(actions[..., -1:], -0.75, 0.75)
+                actions[..., -1:] = torch.clamp(actions[..., -1:], 0.0, 1.0)
 
-                # 3. Batched autoregressive rollout
                 z = c_latent.expand(N, -1, -1)
-                curr_s = init_state.expand(N, -1)
 
                 for h_step in range(H):
                     _a = actions[:, : h_step + 1]
-                    # Iterative state integration: state_next = state_curr + action_curr
-                    # Note: Original uses Rotation matrices but simple addition is often used
-                    # for small delta eulers in many RL contexts.
-                    # To be perfectly compliant with pose integration:
-                    _s_seq = []
-                    _temp_s = init_state.expand(N, -1)
-                    for i in range(h_step + 1):
-                        _s_seq.append(_temp_s.unsqueeze(1))
-                        _temp_s = _temp_s + actions[:, i]
-
-                    _s_seq = torch.cat(_s_seq, dim=1)  # [N, h_step+1, D]
+                    _s_seq = actions[:, : h_step + 1]
 
                     pred = self.predictor(z, _a, _s_seq)
                     if getattr(self.config, "normalize_reps", False):
                         pred = torch.nn.functional.layer_norm(pred, (pred.size(-1),))
 
-                    # Update context with the last prediction for next step
                     if h_step < H - 1:
                         z = torch.cat([z, pred[:, -tokens_per_frame:]], dim=1)
                     else:
                         final_latent = pred[:, -tokens_per_frame:]
 
-                # 4. Evaluation (Cost = distance to goal)
                 g_lat = goal_latent[b : b + 1].expand(N, -1, -1)
                 costs = torch.mean(
                     torch.abs(final_latent - g_lat) ** getattr(self.config, "loss_exp", 1.0), dim=(1, 2)
                 )
 
-                # 5. Selection
                 _, elite_inds = torch.topk(costs, top_k, largest=False)
                 elites = actions[elite_inds]
 
-                # 6. Momentum-based distribution update
                 new_mu = elites.mean(dim=0)
                 new_std = elites.std(dim=0) + 1e-5
 
@@ -213,7 +215,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
 
             best_first_actions.append(mu[0])
 
-        return torch.stack(best_first_actions)  # [B, action_dim]
+        return torch.stack(best_first_actions)
 
     def forward(
         self,
@@ -247,20 +249,27 @@ class VjepaAcPolicy(PreTrainedPolicy):
             if images.ndim == 4:
                 images = images.unsqueeze(2)  # [B, C, 1, H, W]
                 images = self._imagenet_normalize(images)
-   
-                z = self.encoder(images)
+
+                with torch.amp.autocast("cuda", enabled=images.is_cuda, dtype=torch.bfloat16):
+                    z = self.encoder(images)
                 target_latents = z.unsqueeze(1)  # [B, 1, N, D]
             else:
                 # Multi-frame case: [B, T, C, H, W] from LeRobot, needs to be [B, C, T, H, W]
                 B, T, C, H, W = images.shape
                 images = images.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
-                latents = []
                 images = self._imagenet_normalize(images)
 
-                for t in range(T):
-                    z = self.encoder(images[:, :, t : t + 1, :, :])
-                    latents.append(z)
-                target_latents = torch.stack(latents, dim=1)  # [B, T, N_patches, D]
+                # Vectorized encoding: Treat B*T as a single batch of 1-frame "videos"
+                # Correct reshape: images is [B, C, T, H, W], we want [B*T, C, 1, H, W]
+                # We need to swap C and T back to [B, T, C, H, W] BEFORE reshaping to [B*T, C, 1, H, W]
+                # Actually, images.permute(0, 2, 1, 3, 4) gives [B, T, C, H, W] which is what we need to flatten
+                images_flat = images.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)
+                with torch.amp.autocast("cuda", enabled=images.is_cuda, dtype=torch.bfloat16):
+                    latents_flat = self.encoder(images_flat)
+                target_latents = latents_flat.reshape(B, T, -1, latents_flat.shape[-1])
+
+        # Ensure target_latents is back to Float32 for the predictor which is Float32
+        target_latents = target_latents.to(torch.float32)
 
         if target_latents.abs().max() < 1e-6:
             print(

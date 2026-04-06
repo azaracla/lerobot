@@ -2,12 +2,13 @@
 
 seed: 42
 
-output_dir: outputs/vjepa_ac/debug_delta_indices
+output_dir: outputs/vjepa_ac/run_20260406
 
 dataset:
   repo_id: azaracla/community_dataset_v1_aggregated
   revision: main
   streaming: true
+  video_keys: ["observation.images.image"]
   image_transforms:
     enable: true
     max_num_transforms: 1
@@ -23,15 +24,19 @@ dataset:
 
 batch_size: 2
 num_workers: 1
-steps: 1
+steps: 100000
+tolerance_s: 1e-3
+rename_map:
+  "observation.images.image": "observation.images.image"
 eval_freq: 10000
 save_freq: 10000
 log_freq: 100
+use_policy_training_preset: false
 save_checkpoint: true
 
 eval:
-  n_episodes: 50
-  batch_size: 10
+  n_episodes: 5
+  batch_size: 1
 
 policy:
   type: vjepa_ac
@@ -39,10 +44,10 @@ policy:
   encoder_repo_id: "facebookresearch/vjepa2"
   action_dim: 6
   img_size: 384
-  num_frames: 8  # Match DROID paper (8 frames per clip)
-  n_obs_steps: 8  # Number of observation steps
+  num_frames: 4  # Minimized for RAM
+  n_obs_steps: 4  # Minimized for RAM
   vfps: 30  # Original video FPS
-  fps: 4  # Target FPS (matching DROID paper)
+  fps: 4  # 2 frames apart
   use_amp: true
   predictor_embed_dim: 1024
   pred_depth: 24
@@ -55,6 +60,10 @@ policy:
   augmentation_random_resized_crop_ratio: [0.75, 1.35]
   augmentation_random_resized_crop_target_size: 384
   augmentation_horizontal_flip: false
+  log_observation_images: false
+  log_observation_frequency: 1
+  save_images_to_disk: false
+  save_images_dir: outputs/debug_images
 
 optimizer:
   type: adamw
@@ -67,4 +76,4 @@ scheduler:
   num_warmup_steps: 4500  # Match DROID paper
 
 wandb:
-  enable: false
+  enable: true
