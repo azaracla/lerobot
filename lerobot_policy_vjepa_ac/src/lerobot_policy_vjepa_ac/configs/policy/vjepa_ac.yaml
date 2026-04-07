@@ -2,7 +2,7 @@
 
 seed: 42
 
-output_dir: outputs/vjepa_ac/run_20260406
+output_dir: outputs/vjepa_ac/run_20260407
 
 dataset:
   repo_id: azaracla/community_dataset_v1_aggregated
@@ -24,12 +24,12 @@ dataset:
 
 batch_size: 2
 num_workers: 1
-steps: 100000
+steps: 20000
 tolerance_s: 1e-3
 rename_map:
   "observation.images.image": "observation.images.image"
-eval_freq: 10000
-save_freq: 10000
+eval_freq: 2500
+save_freq: 2500
 log_freq: 100
 use_policy_training_preset: false
 save_checkpoint: true
@@ -67,7 +67,7 @@ policy:
 
 optimizer:
   type: adamw
-  lr: 3.32e-6  # Scaled from paper: 4.25e-4 * (2/256)
+  lr: 1e-5  # Scaled from paper: 4.25e-4 * (2/256)
   weight_decay: 0.04  # Match DROID paper
 
 scheduler:

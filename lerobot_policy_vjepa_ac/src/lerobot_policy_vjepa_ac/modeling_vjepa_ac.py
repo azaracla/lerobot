@@ -63,7 +63,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
             param.requires_grad = False
 
         # Initialize the Action-Conditioned Predictor
-        max_seq_len = max(config.num_frames, config.mpc_horizon + 1)
+        # max_seq_len must be a multiple of tubelet_size so that grid_depth = max_seq_len // tubelet_size
+        # covers the longest sequence we'll ever pass (max of n_obs_steps and mpc_horizon+1 temporal positions).
+        max_temporal_depth = max(config.n_obs_steps, config.mpc_horizon + 1)
+        max_seq_len = max_temporal_depth * config.tubelet_size
 
         encoder_embed_dim = self.encoder.embed_dim if hasattr(self.encoder, "embed_dim") else config.embed_dim
         self.predictor = VisionTransformerPredictorAC(
@@ -130,31 +133,13 @@ class VjepaAcPolicy(PreTrainedPolicy):
         device = next(self.encoder.parameters()).device
         img = img.to(device, non_blocking=True)
         img = self._imagenet_normalize(img)
+        if self.config.tubelet_size == 2:
+            img = img.repeat(1, 1, 2, 1, 1)  # [1, C, 1, H, W] → [1, C, 2, H, W]
         with torch.no_grad():
             latent = self.encoder(img)
         if getattr(self.config, "normalize_reps", False):
             latent = torch.nn.functional.layer_norm(latent, (latent.size(-1),))
         return latent
-
-    def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
-        """Normalize state using MIN_MAX normalization to match training."""
-        if self.dataset_stats is None:
-            return state
-
-        obs_state = self.dataset_stats.get("observation.state", {})
-        if not obs_state:
-            return state
-
-        state_min = torch.as_tensor(obs_state.get("min", None), device=state.device, dtype=state.dtype)
-        state_max = torch.as_tensor(obs_state.get("max", None), device=state.device, dtype=state.dtype)
-
-        if state_min is None or state_max is None:
-            return state
-
-        denom = state_max - state_min
-        eps = 1e-8
-        denom = torch.where(denom == 0, torch.tensor(eps, device=state.device), denom)
-        return 2 * (state - state_min) / denom - 1
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
@@ -205,6 +190,8 @@ class VjepaAcPolicy(PreTrainedPolicy):
             img_flat = img_seq.permute(0, 2, 1, 3, 4).reshape(
                 B_s * T_obs, C, 1, self.config.img_size, self.config.img_size
             )
+            if self.config.tubelet_size == 2:
+                img_flat = img_flat.repeat(1, 1, 2, 1, 1)  # match encoder pre-training tubelet_size=2
             with torch.amp.autocast("cuda", enabled=img_flat.is_cuda, dtype=torch.bfloat16):
                 latents_flat = self.encoder(img_flat)  # [B*T_obs, tokens, D]
             latents_flat = latents_flat.to(torch.float32)
@@ -222,11 +209,12 @@ class VjepaAcPolicy(PreTrainedPolicy):
 
         # Historical actions from state differences (Droid convention: a_t = s_{t+1} - s_t)
         # states: [B, T_obs, state_dim] or [B, state_dim]
+        # states are already normalized by the processor (MIN_MAX), no need to re-normalize
         if states.ndim == 3:
-            hist_states = self._normalize_state(states)       # [B, T_obs, state_dim]
+            hist_states = states                              # [B, T_obs, state_dim]
             hist_actions = states[:, 1:] - states[:, :-1]    # [B, T_obs-1, action_dim]
         else:
-            hist_states = self._normalize_state(states).unsqueeze(1)
+            hist_states = states.unsqueeze(1)
             hist_actions = torch.zeros(B, 0, self.config.action_dim, device=device)
 
         N = self.config.cem_num_samples
@@ -304,6 +292,7 @@ class VjepaAcPolicy(PreTrainedPolicy):
         images = batch[image_key]
 
         images = batch[image_key]  # [B, C, T, H, W]
+        # actions are delta values a_k = s_{k+1} - s_k when use_delta_actions=True (preprocessor)
         actions = batch["action"]  # [B, T-1, D]
         states = batch["observation.state"]  # [B, T, D] or [B, D]
 
@@ -317,6 +306,8 @@ class VjepaAcPolicy(PreTrainedPolicy):
             if images.ndim == 4:
                 images = images.unsqueeze(2)  # [B, C, 1, H, W]
                 images = self._imagenet_normalize(images)
+                if self.config.tubelet_size == 2:
+                    images = images.repeat(1, 1, 2, 1, 1)  # [B, C, 2, H, W]
 
                 with torch.amp.autocast("cuda", enabled=images.is_cuda, dtype=torch.bfloat16):
                     z = self.encoder(images)
@@ -327,11 +318,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
                 images = images.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
                 images = self._imagenet_normalize(images)
 
-                # Vectorized encoding: Treat B*T as a single batch of 1-frame "videos"
-                # Correct reshape: images is [B, C, T, H, W], we want [B*T, C, 1, H, W]
-                # We need to swap C and T back to [B, T, C, H, W] BEFORE reshaping to [B*T, C, 1, H, W]
-                # Actually, images.permute(0, 2, 1, 3, 4) gives [B, T, C, H, W] which is what we need to flatten
+                # Vectorized encoding: each frame independently as [B*T, C, 1, H, W]
                 images_flat = images.permute(0, 2, 1, 3, 4).reshape(B * T, C, 1, H, W)
+                if self.config.tubelet_size == 2:
+                    images_flat = images_flat.repeat(1, 1, 2, 1, 1)  # match encoder pre-training tubelet_size=2
                 with torch.amp.autocast("cuda", enabled=images.is_cuda, dtype=torch.bfloat16):
                     latents_flat = self.encoder(images_flat)
                 target_latents = latents_flat.reshape(B, T, -1, latents_flat.shape[-1])
@@ -355,12 +345,16 @@ class VjepaAcPolicy(PreTrainedPolicy):
 
         tokens_per_frame = target_latents.size(1) // T_full
 
-        def _step_predictor(_z, _a, _s, _e=None):
-            if self.config.use_extrinsics and _e is not None:
-                _pred = self.predictor(_z, _a, _s, _e)
-            else:
-                _pred = self.predictor(_z, _a, _s)
+        _autocast = torch.amp.autocast("cuda", enabled=images.is_cuda, dtype=torch.bfloat16)
 
+        def _step_predictor(_z, _a, _s, _e=None):
+            with _autocast:
+                if self.config.use_extrinsics and _e is not None:
+                    _pred = self.predictor(_z, _a, _s, _e)
+                else:
+                    _pred = self.predictor(_z, _a, _s)
+
+            _pred = _pred.to(torch.float32)
             if getattr(self.config, "normalize_reps", False):
                 _pred = torch.nn.functional.layer_norm(_pred, (_pred.size(-1),))
             return _pred
@@ -390,13 +384,31 @@ class VjepaAcPolicy(PreTrainedPolicy):
             _z = torch.cat([_z, _z_nxt], dim=1)
         z_ar = _z[:, tokens_per_frame:]
 
-        def loss_fn(z_pred, target):
-            _target = target[:, tokens_per_frame : z_pred.size(1) + tokens_per_frame]
-            loss_val = torch.mean(torch.abs(z_pred - _target) ** loss_exp) / loss_exp
-            return loss_val
+        # Build per-step valid mask from action_is_pad if available: [B, n_steps, tokens, D]
+        valid_mask = None
+        if "action_is_pad" in batch:
+            n_steps = n_action_steps
+            pad = batch["action_is_pad"][:, :n_steps]  # [B, n_steps]
+            valid = ~pad  # True = valid step
+            valid_mask = (
+                valid.unsqueeze(-1).unsqueeze(-1)
+                .expand(-1, -1, tokens_per_frame, target_latents.size(-1))
+                .reshape(B, n_steps * tokens_per_frame, target_latents.size(-1))
+                .to(target_latents.dtype)
+            )
 
-        jloss = loss_fn(z_tf, target_latents)
-        sloss = loss_fn(z_ar, target_latents)
+        def loss_fn(z_pred, target, mask=None):
+            _target = target[:, tokens_per_frame : z_pred.size(1) + tokens_per_frame]
+            err = torch.abs(z_pred - _target) ** loss_exp / loss_exp
+            if mask is not None:
+                # Slice mask to match z_pred length (z_ar may be shorter than z_tf)
+                mask_slice = mask[:, : err.size(1), :]
+                if mask_slice.shape == err.shape:
+                    return (err * mask_slice).sum() / mask_slice.sum().clamp(min=1)
+            return err.mean()
+
+        jloss = loss_fn(z_tf, target_latents, valid_mask)
+        sloss = loss_fn(z_ar, target_latents, valid_mask)
         loss = jloss + sloss
 
         return loss, {"loss": loss.item(), "jloss": jloss.item(), "sloss": sloss.item()}

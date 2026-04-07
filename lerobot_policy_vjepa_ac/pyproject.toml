@@ -28,3 +28,7 @@ packages = ["src/lerobot_policy_vjepa_ac"]
 
 [tool.lerobot]
 policy_type = "vjepa_ac"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

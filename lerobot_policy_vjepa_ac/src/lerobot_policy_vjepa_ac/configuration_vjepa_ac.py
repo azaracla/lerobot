@@ -23,13 +23,19 @@ class VjepaAcConfig(PreTrainedConfig):
         }
     )
 
+    # When True, the preprocessor computes a_k = s_{k+1} - s_k from observation.state
+    # (DROID/VJEPA-AC convention) instead of using batch["action"] absolute positions.
+    # ACTION normalization is forced to IDENTITY because delta stats ≠ absolute stats.
+    # The postprocessor then converts deltas back to absolute joint targets.
+    use_delta_actions: bool = True
+
     predictor_embed_dim: int = 1024
     action_dim: int = 6
     pred_depth: int = 24
     num_heads: int = 16
     mlp_ratio: float = 4.0
     num_frames: int = 1
-    tubelet_size: int = 1
+    tubelet_size: int = 2
     vfps: int = 30  # Original video FPS (LeRobot datasets are typically 30fps)
     fps: int = 4  # Target FPS for temporal sampling (matching DROID paper)
 
@@ -52,7 +58,7 @@ class VjepaAcConfig(PreTrainedConfig):
     scheduler_final_lr: float = 0.0
     loss_exp: float = 1.0
     auto_steps: int = 1
-    normalize_reps: bool = False
+    normalize_reps: bool = True
     use_extrinsics: bool = False
     use_imagenet_for_visuals: bool = True
     goal_image_path: str | None = None

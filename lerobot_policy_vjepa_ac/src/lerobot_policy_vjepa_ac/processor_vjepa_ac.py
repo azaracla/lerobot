@@ -2,7 +2,7 @@ from typing import Any
 from pathlib import Path
 import numpy as np
 import torch
-from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+from lerobot.configs.types import NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -15,6 +15,7 @@ from lerobot.processor import (
 )
 from lerobot.processor.pipeline import ProcessorStep
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.types import TransitionKey
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 from .configuration_vjepa_ac import VjepaAcConfig
 
@@ -154,6 +155,114 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
         )
 
 
+@ProcessorStepRegistry.register(name="vjepa_ac_state_to_delta_action")
+class StateToDeltaActionProcessorStep(ProcessorStep):
+    """
+    Preprocessor: replaces batch["action"] with sequential state deltas
+    a_k = s_{k+1} - s_k computed from observation.state (DROID/VJEPA-AC convention).
+
+    Also caches the last observed state so the paired postprocessor can convert
+    the model's delta output back to absolute joint targets.
+
+    At inference there is no "action" key — we only cache the current state.
+    """
+
+    def __call__(self, transition: dict[str, Any]) -> dict[str, Any]:
+        new_transition = transition.copy()
+
+        obs = new_transition.get(TransitionKey.OBSERVATION, {})
+        state = obs.get("observation.state")  # [B, T, D]
+
+        if state is None or not isinstance(state, torch.Tensor) or state.ndim < 2:
+            return new_transition
+
+        if state.ndim == 2:
+            # Single frame — cache state, nothing to diff
+            self._current_state = state  # [B, D]
+            return new_transition
+
+        # state: [B, T, D]
+        self._current_state = state[:, -1]  # cache latest frame [B, D]
+
+        action = new_transition.get(TransitionKey.ACTION)
+        if action is not None and isinstance(action, torch.Tensor):
+            delta = state[:, 1:] - state[:, :-1]  # [B, T-1, D]
+            new_transition[TransitionKey.ACTION] = delta
+
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {}
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        pass
+
+    def reset(self) -> None:
+        self._current_state = None
+
+
+@ProcessorStepRegistry.register(name="vjepa_ac_delta_to_absolute_action")
+class DeltaToAbsoluteActionProcessorStep(ProcessorStep):
+    """
+    Postprocessor: converts delta action sequence (model output) back to absolute
+    joint targets by adding the cached current state from the paired preprocessor.
+
+    delta_actions: [B, H, D]  (output of CEM, already unnormalized)
+    absolute:      [B, H, D]  cumulative sum starting from current_state
+      absolute[:, 0] = current_state + delta[:, 0]
+      absolute[:, k] = current_state + sum(delta[:, 0:k+1])
+    """
+
+    def __init__(self, preprocessor: "StateToDeltaActionProcessorStep"):
+        self._preprocessor = preprocessor
+
+    def __call__(self, transition: dict[str, Any]) -> dict[str, Any]:
+        action = transition.get(TransitionKey.ACTION)
+        if action is None or not isinstance(action, torch.Tensor):
+            return transition
+
+        current_state = getattr(self._preprocessor, "_current_state", None)
+        if current_state is None:
+            return transition
+
+        # action: [B, H, D], current_state: [B, D]
+        if action.ndim == 2:
+            # [B, D] single-step delta
+            absolute = current_state + action
+        else:
+            # [B, H, D] multi-step delta — cumsum gives trajectory of absolute targets
+            absolute = current_state.unsqueeze(1) + torch.cumsum(action, dim=1)
+
+        new_transition = transition.copy()
+        new_transition[TransitionKey.ACTION] = absolute
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+    def get_config(self) -> dict[str, Any]:
+        return {}
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+
 def make_vjepa_ac_pre_post_processors(
     config: VjepaAcConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -161,17 +270,32 @@ def make_vjepa_ac_pre_post_processors(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
+    # When use_delta_actions=True, ACTION normalization must be IDENTITY:
+    # delta stats ≠ absolute stats, and the action_encoder linear layer handles scaling.
+    norm_map = dict(config.normalization_mapping)
+    if config.use_delta_actions:
+        norm_map["ACTION"] = NormalizationMode.IDENTITY
+
+    delta_step = StateToDeltaActionProcessorStep() if config.use_delta_actions else None
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+    ]
+
+    if delta_step is not None:
+        # Must run AFTER device placement (tensors on GPU) and BEFORE normalizer
+        input_steps.append(delta_step)
+
+    input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
-            norm_map=config.normalization_mapping,
+            norm_map=norm_map,
             stats=dataset_stats,
             device=config.device,
-        ),
-    ]
+        )
+    )
 
     if config.log_observation_images:
         input_steps.insert(
@@ -186,12 +310,16 @@ def make_vjepa_ac_pre_post_processors(
             ),
         )
 
-    output_steps = [
+    output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features, norm_map=norm_map, stats=dataset_stats
         ),
-        DeviceProcessorStep(device="cpu"),
     ]
+
+    if delta_step is not None:
+        output_steps.append(DeltaToAbsoluteActionProcessorStep(preprocessor=delta_step))
+
+    output_steps.append(DeviceProcessorStep(device="cpu"))
 
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
