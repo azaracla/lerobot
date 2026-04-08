@@ -77,43 +77,6 @@ class VQBeTSchedulerConfig(LRSchedulerConfig):
         return LambdaLR(optimizer, lr_lambda, -1)
 
 
-@LRSchedulerConfig.register_subclass("wsd")
-@dataclass
-class WSDSchedulerConfig(LRSchedulerConfig):
-    """Warmup-Stable-Decay scheduler.
-
-    Used for VJEPA AC training on DROID-scale data.
-    Linear warmup, constant middle, cosine decay.
-    """
-
-    num_warmup_steps: int = 4500
-    num_stable_steps: int = 85500
-    num_anneal_steps: int = 4500
-    start_lr: float = 7.5e-5
-    peak_lr: float = 4.25e-4
-    final_lr: float = 0.0
-
-    def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
-        total_steps = self.num_warmup_steps + self.num_stable_steps + self.num_anneal_steps
-
-        def lr_lambda(current_step):
-            if current_step < self.num_warmup_steps:
-                return self.start_lr + (self.peak_lr - self.start_lr) * current_step / max(
-                    1, self.num_warmup_steps
-                )
-            elif current_step < self.num_warmup_steps + self.num_stable_steps:
-                return self.peak_lr
-            else:
-                progress = (current_step - self.num_warmup_steps - self.num_stable_steps) / max(
-                    1, self.num_anneal_steps
-                )
-                progress = min(progress, 1.0)
-                return self.peak_lr + (self.final_lr - self.peak_lr) * 0.5 * (
-                    1 + math.cos(math.pi * progress)
-                )
-
-        return LambdaLR(optimizer, lr_lambda, -1)
-
 
 @LRSchedulerConfig.register_subclass("cosine_decay_with_warmup")
 @dataclass

@@ -8,7 +8,6 @@ dataset:
   repo_id: azaracla/community_dataset_v1_aggregated
   episodes: [0]  # On ne prend QUE le premier épisode
   streaming: true
-  video_keys: ["observation.images.image"]
   image_transforms:
     enable: true
     max_num_transforms: 1

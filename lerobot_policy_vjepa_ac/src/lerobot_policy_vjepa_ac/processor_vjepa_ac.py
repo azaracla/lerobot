@@ -19,6 +19,10 @@ from lerobot.types import TransitionKey
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 from .configuration_vjepa_ac import VjepaAcConfig
 
+# Shared state between StateToDeltaAction (pre) and DeltaToAbsolute (post).
+# Used as fallback when the steps are instantiated independently (e.g. from_pretrained).
+_DELTA_STATE_CACHE: dict[str, Any] = {"current_state": None}
+
 
 @ProcessorStepRegistry.register(name="vjepa_ac_logging_processor")
 class VjepaAcLoggingProcessorStep(ProcessorStep):
@@ -183,6 +187,7 @@ class StateToDeltaActionProcessorStep(ProcessorStep):
 
         # state: [B, T, D]
         self._current_state = state[:, -1]  # cache latest frame [B, D]
+        _DELTA_STATE_CACHE["current_state"] = self._current_state
 
         action = new_transition.get(TransitionKey.ACTION)
         if action is not None and isinstance(action, torch.Tensor):
@@ -221,7 +226,7 @@ class DeltaToAbsoluteActionProcessorStep(ProcessorStep):
       absolute[:, k] = current_state + sum(delta[:, 0:k+1])
     """
 
-    def __init__(self, preprocessor: "StateToDeltaActionProcessorStep"):
+    def __init__(self, preprocessor: "StateToDeltaActionProcessorStep | None" = None):
         self._preprocessor = preprocessor
 
     def __call__(self, transition: dict[str, Any]) -> dict[str, Any]:
@@ -229,7 +234,10 @@ class DeltaToAbsoluteActionProcessorStep(ProcessorStep):
         if action is None or not isinstance(action, torch.Tensor):
             return transition
 
-        current_state = getattr(self._preprocessor, "_current_state", None)
+        if self._preprocessor is not None:
+            current_state = getattr(self._preprocessor, "_current_state", None)
+        else:
+            current_state = _DELTA_STATE_CACHE.get("current_state")
         if current_state is None:
             return transition
 

@@ -1,8 +1,10 @@
 # @package _global_
+# Config cloud — L40S 46GB VRAM
+# batch_size 12 (vs 4 local) + num_workers 8
 
 seed: 42
 
-output_dir: outputs/vjepa_ac/run_20260408
+output_dir: outputs/vjepa_ac/run_cloud  # overridé par vastai_remote_setup.sh
 
 dataset:
   repo_id: azaracla/community_dataset_v1_aggregated
@@ -19,10 +21,10 @@ dataset:
         kwargs:
           scale: 1.777
           ratio: [0.75, 1.35]
-          target_size: 384  # Match vjepa2.1 native resolution
+          target_size: 384
 
-batch_size: 4
-num_workers: 1
+batch_size: 12        # 3x local — L40S 46GB le supporte (~24GB activations estimées)
+num_workers: 8        # 12 vCPUs dispo
 steps: 50000
 tolerance_s: 1e-3
 rename_map:
@@ -43,10 +45,10 @@ policy:
   encoder_repo_id: "facebookresearch/vjepa2"
   action_dim: 6
   img_size: 384
-  num_frames: 4  # Minimized for RAM
-  n_obs_steps: 4  # Minimized for RAM
-  vfps: 30  # Original video FPS
-  fps: 4  # 2 frames apart
+  num_frames: 4
+  n_obs_steps: 4
+  vfps: 30
+  fps: 4
   use_amp: true
   predictor_embed_dim: 1024
   pred_depth: 24
@@ -66,13 +68,13 @@ policy:
 
 optimizer:
   type: adamw
-  lr: 1e-5  # Scaled from paper: 4.25e-4 * (2/256)
-  weight_decay: 0.04  # Match DROID paper
+  lr: 3e-5            # LR scalé linéairement : 1e-5 * (12/4) = 3e-5
+  weight_decay: 0.04
 
 scheduler:
   type: diffuser
   name: cosine
-  num_warmup_steps: 4500  # Match DROID paper
+  num_warmup_steps: 4500
 
 wandb:
   enable: true
