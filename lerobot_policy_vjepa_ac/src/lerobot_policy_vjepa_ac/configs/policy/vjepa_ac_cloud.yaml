@@ -9,7 +9,7 @@ output_dir: outputs/vjepa_ac/run_cloud  # overridé par vastai_remote_setup.sh
 dataset:
   repo_id: azaracla/community_dataset_v1_aggregated
   revision: main
-  streaming: false
+  streaming: true
   image_transforms:
     enable: true
     max_num_transforms: 1

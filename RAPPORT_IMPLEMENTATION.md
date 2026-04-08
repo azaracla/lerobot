@@ -226,3 +226,5 @@ La fonction de loss `torch.mean(|z_pred - target|^loss_exp) / loss_exp` est iden
 | Infrastructure train | 🔄 Adapté | LeRobot vs custom SLURM |
 
 La réimplémentation est **structurellement fidèle** au papier V-JEPA 2-AC. Les adaptations SO-101 (action_dim=6, joints vs EE, pas d'extrinsics) sont justifiées par le changement de plateforme. Les deux risques principaux à investiguer sont l'encodage tubelet_size et l'activation potentielle de `normalize_reps`.
+
+Ecris par Claude
