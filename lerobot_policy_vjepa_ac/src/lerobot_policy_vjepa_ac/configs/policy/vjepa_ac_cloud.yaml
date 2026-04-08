@@ -29,8 +29,8 @@ steps: 50000
 tolerance_s: 1e-3
 rename_map:
   "observation.images.image": "observation.images.image"
-eval_freq: 10000
-save_freq: 10000
+eval_freq: 50000
+save_freq: 50000
 log_freq: 100
 use_policy_training_preset: false
 save_checkpoint: true
@@ -41,6 +41,8 @@ eval:
 
 policy:
   type: vjepa_ac
+  push_to_hub: true
+  repo_id: azaracla/vjepa_ac
   model_name: "vjepa2_1_vit_giant_384"
   encoder_repo_id: "facebookresearch/vjepa2"
   action_dim: 6
@@ -72,9 +74,13 @@ optimizer:
   weight_decay: 0.04
 
 scheduler:
-  type: diffuser
-  name: cosine
-  num_warmup_steps: 4500
+  type: wsd
+  num_warmup_steps: 1500   # 4500 local / 3 (batch scale) — même nb de samples
+  num_stable_steps: 44000
+  num_anneal_steps: 1500
+  start_lr: 1e-6
+  peak_lr: 3e-5
+  final_lr: 0.0
 
 wandb:
   enable: true
