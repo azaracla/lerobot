@@ -21,7 +21,7 @@ from .configuration_vjepa_ac import VjepaAcConfig
 
 # Shared state between StateToDeltaAction (pre) and DeltaToAbsolute (post).
 # Used as fallback when the steps are instantiated independently (e.g. from_pretrained).
-_DELTA_STATE_CACHE: dict[str, Any] = {"current_state": None}
+_DELTA_STATE_CACHE: dict[str, Any] = {"current_state": None, "raw_deltas": None}
 
 
 @ProcessorStepRegistry.register(name="vjepa_ac_logging_processor")
@@ -189,10 +189,14 @@ class StateToDeltaActionProcessorStep(ProcessorStep):
         self._current_state = state[:, -1]  # cache latest frame [B, D]
         _DELTA_STATE_CACHE["current_state"] = self._current_state
 
+        # Cache raw deltas (before normalization) so select_action() can use them
+        raw_deltas = state[:, 1:] - state[:, :-1]  # [B, T-1, D]
+        self._raw_deltas = raw_deltas
+        _DELTA_STATE_CACHE["raw_deltas"] = raw_deltas
+
         action = new_transition.get(TransitionKey.ACTION)
         if action is not None and isinstance(action, torch.Tensor):
-            delta = state[:, 1:] - state[:, :-1]  # [B, T-1, D]
-            new_transition[TransitionKey.ACTION] = delta
+            new_transition[TransitionKey.ACTION] = raw_deltas
 
         return new_transition
 

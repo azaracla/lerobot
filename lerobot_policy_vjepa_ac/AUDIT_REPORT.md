@@ -568,6 +568,36 @@ Le training actuel (jloss teacher-forcing) est **correct**. Les poids ne sont pa
 
 ---
 
+## 11. CORRECTIONS APPLIQUÉES (2026-04-09)
+
+### P0 — Appliquées
+
+| # | Problème | Fix appliqué |
+|---|---|---|
+| 1 | `auto_steps=1` : pas de rollout loss (§4.1/§3.5) | `configuration_vjepa_ac.py` : `auto_steps: int = 2`. `vjepa_ac.yaml` + `vjepa_ac_cloud.yaml` : `auto_steps: 2` |
+
+### P1 — Appliquées (sauf §4.3)
+
+| # | Problème | Fix appliqué |
+|---|---|---|
+| 2 | hist_actions mismatch train/inférence (§3.1) | `processor_vjepa_ac.py` : `StateToDeltaActionProcessorStep` cache les raw deltas dans `_DELTA_STATE_CACHE["raw_deltas"]` et `self._raw_deltas` avant normalisation. `modeling_vjepa_ac.py` : import de `_DELTA_STATE_CACHE` + `select_action()` lit `raw_deltas` depuis le cache (fallback sur deltas normalisés si cache vide) |
+| 3 | Image dim ordering dans `select_action` (§3.4) | `modeling_vjepa_ac.py` : ajout de `images.permute(0, 2, 1, 3, 4)` pour les tenseurs 5D, aligné avec `forward()` qui faisait déjà la permutation |
+| 4 | Actions utilisées comme states dans CEM H>1 (§3.3) | **Contourné** : `mpc_horizon: 1` dans les deux YAMLs — la boucle `for h in range(1, H)` ne s'exécute jamais. Fix complet (dénormalisation/renormalisation des states dans la boucle) à implémenter si horizon > 1 est nécessaire |
+| 5 | `cem_maxnorm` jamais appliqué (§3.2) | `modeling_vjepa_ac.py` : ajout de `actions = torch.clamp(actions, -maxnorm, maxnorm)` après le sampling dans la boucle CEM |
+| 6 | `cem_std=0.5` trop grand (§4.3) | ❌ **Non fait** — calibration empirique sur le dataset recommandée avant de choisir une valeur. Script de calibration disponible en §4.3. Valeur par défaut ~0.03 suggérée |
+| 7 | `mpc_horizon=15` dans les YAMLs (§3.5) | `vjepa_ac.yaml` + `vjepa_ac_cloud.yaml` : `mpc_horizon: 1` (aligne avec Table 3 du papier, neutralise aussi §3.3) |
+
+### P2 — Appliquées (sauf §4.2)
+
+| # | Problème | Fix appliqué |
+|---|---|---|
+| 8 | `action_delta_indices` charge 15 actions inutiles (§5.3) | `configuration_vjepa_ac.py` : quand `use_delta_actions=True`, retourne `list(range(n_obs_steps - 1))` au lieu de `list(range(mpc_horizon))` |
+| 9 | Masque attention pré-alloué trop grand (§5.2) | `modeling_vjepa_ac.py` `__init__` : `max_temporal_depth = config.n_obs_steps` au lieu de `max(n_obs_steps, mpc_horizon + 1)`. Avec n_obs_steps=4 : masque 5MB au lieu de 82MB (ancien mpc_horizon=15) |
+| 10 | `embed_dim=1536` incorrect (§5.1) | `configuration_vjepa_ac.py` : `embed_dim: int = 1408` (ViT-Giant-384 réel ; valeur de fallback uniquement, le runtime utilise `encoder.embed_dim`) |
+| 11 | CEM uniforme sur 6 joints (§4.2) | ❌ **Non fait** — optionnel pour SO-101 (6 servos aux dynamiques similaires). À implémenter via `cem_std_per_joint: list[float] | None` si les résultats ne sont pas satisfaisants |
+
+---
+
 ## 10. RÉSUMÉ
 
 L'intégration architecturale dans LeRobot est **solide** — le predictor est un portage fidèle, le pipeline processor est bien conçu, et les abstractions LeRobot sont correctement utilisées. Les problèmes identifiés sont principalement au niveau de **la cohérence entre entraînement et inférence** (action space mismatch, horizon mismatch, auto_steps) et des **hyperparamètres CEM inadaptés au joint space** SO-101. Ce sont des problèmes corrigeables sans refonte architecturale.

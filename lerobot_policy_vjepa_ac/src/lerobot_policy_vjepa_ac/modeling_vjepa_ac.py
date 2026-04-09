@@ -15,6 +15,7 @@ from .ac_predictor_utils import VisionTransformerPredictorAC
 
 
 from safetensors.torch import load_file, load_model
+from .processor_vjepa_ac import _DELTA_STATE_CACHE
 import os
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
@@ -63,9 +64,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
             param.requires_grad = False
 
         # Initialize the Action-Conditioned Predictor
-        # max_seq_len must be a multiple of tubelet_size so that grid_depth = max_seq_len // tubelet_size
-        # covers the longest sequence we'll ever pass (max of n_obs_steps and mpc_horizon+1 temporal positions).
-        max_temporal_depth = max(config.n_obs_steps, config.mpc_horizon + 1)
+        # The causal attention mask is only used during training (T > 1).
+        # CEM rolling (T=1) skips the mask and uses FlashAttention.
+        # So we only need to cover n_obs_steps temporal positions, not mpc_horizon.
+        max_temporal_depth = config.n_obs_steps
         max_seq_len = max_temporal_depth * config.tubelet_size
 
         encoder_embed_dim = self.encoder.embed_dim if hasattr(self.encoder, "embed_dim") else config.embed_dim
@@ -168,9 +170,10 @@ class VjepaAcPolicy(PreTrainedPolicy):
         device = images.device
 
         with torch.no_grad():
-            # images: [B, C, T, H, W] (ndim=5) or [B, C, H, W] (ndim=4)
+            # images: [B, T, C, H, W] (LeRobot) or [B, C, H, W] (ndim=4)
             if images.ndim == 5:
-                img_seq = images  # [B, C, T_obs, H, W]
+                # LeRobot delivers [B, T, C, H, W] — convert to [B, C, T, H, W]
+                img_seq = images.permute(0, 2, 1, 3, 4)
             else:
                 img_seq = images.unsqueeze(2)  # [B, C, 1, H, W]
 
@@ -211,8 +214,15 @@ class VjepaAcPolicy(PreTrainedPolicy):
         # states: [B, T_obs, state_dim] or [B, state_dim]
         # states are already normalized by the processor (MIN_MAX), no need to re-normalize
         if states.ndim == 3:
-            hist_states = states                              # [B, T_obs, state_dim]
-            hist_actions = states[:, 1:] - states[:, :-1]    # [B, T_obs-1, action_dim]
+            hist_states = states  # [B, T_obs, state_dim] — MIN_MAX normalized
+            # Use raw deltas cached by the preprocessor (computed before normalization)
+            # to match the training distribution (action IDENTITY, not normalized deltas)
+            raw_deltas = _DELTA_STATE_CACHE.get("raw_deltas")
+            if raw_deltas is not None and raw_deltas.shape[0] == B:
+                hist_actions = raw_deltas.to(device)
+            else:
+                # Fallback if preprocessor didn't run (e.g. manual call)
+                hist_actions = states[:, 1:] - states[:, :-1]
         else:
             hist_states = states.unsqueeze(1)
             hist_actions = torch.zeros(B, 0, self.config.action_dim, device=device)
@@ -239,8 +249,11 @@ class VjepaAcPolicy(PreTrainedPolicy):
         mu = torch.zeros(H, self.config.action_dim, device=device)
         std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
 
+        maxnorm = getattr(self.config, "cem_maxnorm", 0.05)
+
         for _ in range(self.config.cem_num_iters):
             actions = mu.unsqueeze(0) + std.unsqueeze(0) * torch.randn(N, H, self.config.action_dim, device=device)
+            actions = torch.clamp(actions, -maxnorm, maxnorm)
 
             # Step 0: full T_obs-frame context (matches training), causal attention active
             a_traj0 = torch.cat([h_act_N, actions[:, :1]], dim=1)  # [N, T_obs, action_dim]

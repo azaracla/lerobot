@@ -50,7 +50,8 @@ policy:
   use_amp: true
   predictor_embed_dim: 1024
   pred_depth: 24
-  mpc_horizon: 15
+  mpc_horizon: 1
+  auto_steps: 2
   cem_num_samples: 200
   cem_num_iters: 3
   use_imagenet_for_visuals: true

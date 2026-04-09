@@ -13,7 +13,7 @@ class VjepaAcConfig(PreTrainedConfig):
     push_to_hub: bool = False
     img_size: int = 384
     patch_size: int = 16
-    embed_dim: int = 1536
+    embed_dim: int = 1408  # ViT-Giant-384 actual embed_dim (fallback only, runtime uses encoder.embed_dim)
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -57,7 +57,7 @@ class VjepaAcConfig(PreTrainedConfig):
     scheduler_start_lr: float = 7.5e-5
     scheduler_final_lr: float = 0.0
     loss_exp: float = 1.0
-    auto_steps: int = 1
+    auto_steps: int = 2
     normalize_reps: bool = True
     use_extrinsics: bool = False
     use_imagenet_for_visuals: bool = True
@@ -116,7 +116,9 @@ class VjepaAcConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        # We predict a horizon of actions
+        if self.use_delta_actions:
+            # Actions come from state deltas (T-1 steps), no need to load mpc_horizon future actions
+            return list(range(self.n_obs_steps - 1))
         return list(range(self.mpc_horizon))
 
     @property
