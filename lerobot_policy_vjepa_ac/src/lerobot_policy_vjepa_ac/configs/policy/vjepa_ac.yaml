@@ -54,6 +54,13 @@ policy:
   auto_steps: 2
   cem_num_samples: 200
   cem_num_iters: 3
+  # Per-joint CEM calibration — intra-episode delta stats (100 episodes, 41878 frames)
+  # azaracla/community_dataset_v1_aggregated, 30fps natif, units: degrees
+  # [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
+  # std  = [0.45, 1.01, 0.87, 0.34, 0.58, 0.42]
+  # max  = 3 * std (same rule as Meta DROID: maxnorm ≈ 3×std for planned dimensions)
+  cem_std_per_joint: [0.45, 1.01, 0.87, 0.34, 0.58, 0.42]
+  cem_maxnorm_per_joint: [1.35, 3.03, 2.62, 1.03, 1.74, 1.26]
   use_imagenet_for_visuals: true
   augmentation_random_resized_crop_enabled: true
   augmentation_random_resized_crop_scale: 1.777

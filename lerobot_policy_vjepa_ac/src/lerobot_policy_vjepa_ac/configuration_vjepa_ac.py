@@ -43,9 +43,18 @@ class VjepaAcConfig(PreTrainedConfig):
     cem_num_samples: int = 200  # paper uses 800 on 4090 24GB; reduce if OOM on 16GB
     cem_num_iters: int = 10
     cem_elite_ratio: float = 0.1
-    cem_std: float = 0.5
     cem_momentum_mean: float = 0.25
     cem_momentum_std: float = 0.95
+
+    # Per-joint CEM hyperparameters (calibrated from dataset delta stats).
+    # Rule: cem_std_per_joint = std(deltas), cem_maxnorm_per_joint = 3 * std(deltas).
+    # This matches Meta's approach for DROID: maxnorm ≈ 3×std for xyz dimensions.
+    # When set, these override the scalar cem_std / cem_maxnorm.
+    cem_std_per_joint: list[float] | None = None
+    cem_maxnorm_per_joint: list[float] | None = None
+
+    # Scalar fallbacks (used when cem_*_per_joint is None)
+    cem_std: float = 0.05   # default = maxnorm (matches Meta original mpc_utils.py:77)
     cem_maxnorm: float = 0.05
 
     optimizer_lr: float = 1e-4

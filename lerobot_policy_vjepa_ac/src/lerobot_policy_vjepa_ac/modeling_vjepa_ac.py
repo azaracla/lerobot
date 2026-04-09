@@ -15,7 +15,7 @@ from .ac_predictor_utils import VisionTransformerPredictorAC
 
 
 from safetensors.torch import load_file, load_model
-from .processor_vjepa_ac import _DELTA_STATE_CACHE
+from .processor_vjepa_ac import RAW_DELTAS_KEY
 import os
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
@@ -215,13 +215,17 @@ class VjepaAcPolicy(PreTrainedPolicy):
         # states are already normalized by the processor (MIN_MAX), no need to re-normalize
         if states.ndim == 3:
             hist_states = states  # [B, T_obs, state_dim] — MIN_MAX normalized
-            # Use raw deltas cached by the preprocessor (computed before normalization)
-            # to match the training distribution (action IDENTITY, not normalized deltas)
-            raw_deltas = _DELTA_STATE_CACHE.get("raw_deltas")
-            if raw_deltas is not None and raw_deltas.shape[0] == B:
+            # Use raw deltas passed through the batch by the preprocessor
+            # (computed before normalization, matching training action space: IDENTITY)
+            raw_deltas = batch.get(RAW_DELTAS_KEY)
+            if raw_deltas is not None:
                 hist_actions = raw_deltas.to(device)
             else:
-                # Fallback if preprocessor didn't run (e.g. manual call)
+                import warnings
+                warnings.warn(
+                    "raw_deltas not found in batch — computing deltas on normalized states. "
+                    "This produces incorrect actions. Ensure the preprocessor runs before select_action()."
+                )
                 hist_actions = states[:, 1:] - states[:, :-1]
         else:
             hist_states = states.unsqueeze(1)
@@ -247,9 +251,17 @@ class VjepaAcPolicy(PreTrainedPolicy):
         g_lat = goal_latent[0:1].expand(N, -1, -1)       # [N, tokens, D]
 
         mu = torch.zeros(H, self.config.action_dim, device=device)
-        std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
 
-        maxnorm = getattr(self.config, "cem_maxnorm", 0.05)
+        # Per-joint std/maxnorm (calibrated from dataset delta stats) — overrides scalar fallbacks.
+        if self.config.cem_std_per_joint is not None:
+            std = torch.tensor(self.config.cem_std_per_joint, device=device).unsqueeze(0).expand(H, -1)
+        else:
+            std = torch.full((H, self.config.action_dim), self.config.cem_std, device=device)
+
+        if self.config.cem_maxnorm_per_joint is not None:
+            maxnorm = torch.tensor(self.config.cem_maxnorm_per_joint, device=device)  # [action_dim]
+        else:
+            maxnorm = self.config.cem_maxnorm
 
         for _ in range(self.config.cem_num_iters):
             actions = mu.unsqueeze(0) + std.unsqueeze(0) * torch.randn(N, H, self.config.action_dim, device=device)

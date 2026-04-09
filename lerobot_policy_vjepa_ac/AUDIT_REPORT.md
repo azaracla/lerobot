@@ -501,7 +501,8 @@ def action_delta_indices(self) -> list:
 | `forward()` retourne `(loss, dict)` | Implémenté | — |
 | `select_action()` devrait utiliser des deques | Pas de deque (MPC replanning à chaque step) | OK pour MPC |
 | `predict_action_chunk()` devrait être la méthode principale | Délègue à `select_action()` | OK pour MPC |
-| Processors sérialisables pour from_pretrained | `_DELTA_STATE_CACHE` global comme fallback | Fragile mais fonctionne |
+| Données model ← preprocessor via le batch | ✅ `RAW_DELTAS_KEY` dans la transition (batch) — `select_action()` lit `batch["observation.raw_deltas"]` | Best practice LeRobot |
+| Partage d'état pre/post processor | Ref directe `preprocessor=delta_step` (co-créés dans la même factory) — le postprocessor n'a pas accès au batch d'entrée par design LeRobot, donc la ref entre steps est le pattern le plus propre possible | Acceptable, erreur explicite si ref manquante |
 | `reset()` devrait réinitialiser l'état | No-op (pas d'état temporel) | OK |
 
 ---
@@ -580,7 +581,7 @@ Le training actuel (jloss teacher-forcing) est **correct**. Les poids ne sont pa
 
 | # | Problème | Fix appliqué |
 |---|---|---|
-| 2 | hist_actions mismatch train/inférence (§3.1) | `processor_vjepa_ac.py` : `StateToDeltaActionProcessorStep` cache les raw deltas dans `_DELTA_STATE_CACHE["raw_deltas"]` et `self._raw_deltas` avant normalisation. `modeling_vjepa_ac.py` : import de `_DELTA_STATE_CACHE` + `select_action()` lit `raw_deltas` depuis le cache (fallback sur deltas normalisés si cache vide) |
+| 2 | hist_actions mismatch train/inférence (§3.1) | **Refactoré (2026-04-09)** : suppression du global `_DELTA_STATE_CACHE`. Deux mécanismes distincts : (1) **raw_deltas → modèle** : `StateToDeltaActionProcessorStep` écrit `observation.raw_deltas` dans la transition/batch, `select_action()` lit `batch["observation.raw_deltas"]` (warning si absent). (2) **current_state → postprocessor** : ref directe `preprocessor=delta_step` entre steps co-créés dans `make_vjepa_ac_pre_post_processors()` — nécessaire car le postprocessor LeRobot n'a pas accès au batch d'entrée par design. `RuntimeError` explicite si ref manquante. |
 | 3 | Image dim ordering dans `select_action` (§3.4) | `modeling_vjepa_ac.py` : ajout de `images.permute(0, 2, 1, 3, 4)` pour les tenseurs 5D, aligné avec `forward()` qui faisait déjà la permutation |
 | 4 | Actions utilisées comme states dans CEM H>1 (§3.3) | **Contourné** : `mpc_horizon: 1` dans les deux YAMLs — la boucle `for h in range(1, H)` ne s'exécute jamais. Fix complet (dénormalisation/renormalisation des states dans la boucle) à implémenter si horizon > 1 est nécessaire |
 | 5 | `cem_maxnorm` jamais appliqué (§3.2) | `modeling_vjepa_ac.py` : ajout de `actions = torch.clamp(actions, -maxnorm, maxnorm)` après le sampling dans la boucle CEM |
@@ -594,10 +595,173 @@ Le training actuel (jloss teacher-forcing) est **correct**. Les poids ne sont pa
 | 8 | `action_delta_indices` charge 15 actions inutiles (§5.3) | `configuration_vjepa_ac.py` : quand `use_delta_actions=True`, retourne `list(range(n_obs_steps - 1))` au lieu de `list(range(mpc_horizon))` |
 | 9 | Masque attention pré-alloué trop grand (§5.2) | `modeling_vjepa_ac.py` `__init__` : `max_temporal_depth = config.n_obs_steps` au lieu de `max(n_obs_steps, mpc_horizon + 1)`. Avec n_obs_steps=4 : masque 5MB au lieu de 82MB (ancien mpc_horizon=15) |
 | 10 | `embed_dim=1536` incorrect (§5.1) | `configuration_vjepa_ac.py` : `embed_dim: int = 1408` (ViT-Giant-384 réel ; valeur de fallback uniquement, le runtime utilise `encoder.embed_dim`) |
-| 11 | CEM uniforme sur 6 joints (§4.2) | ❌ **Non fait** — optionnel pour SO-101 (6 servos aux dynamiques similaires). À implémenter via `cem_std_per_joint: list[float] | None` si les résultats ne sont pas satisfaisants |
+| 11 | CEM uniforme sur 6 joints (§4.2) | ✅ **Fait (2026-04-09)** — voir §13 |
+
+---
+
+## 13. CALIBRATION CEM PAR JOINT (2026-04-09)
+
+### 13.1 Analyse comparative DROID vs SO-101
+
+#### DROID (lerobot/droid_100, 15fps, end-effector cartésien 7D)
+
+Stats mesurées sur 1000 frames :
+
+| Index | Interprétation | State range | State std | Delta std (15fps) | Action Meta |
+|-------|---------------|-------------|-----------|-------------------|-------------|
+| 0 | End-effector X (m) | [0.31, 0.68] | 0.090 | 0.0063 | Planifié, clamp ±0.05 |
+| 1 | End-effector Y (m) | [-0.24, 0.23] | 0.118 | 0.0097 | Planifié, clamp ±0.05 |
+| 2 | End-effector Z (m) | [0.06, 0.74] | 0.174 | 0.0163 | Planifié, clamp ±0.05 |
+| 3 | Rotation wrist (rad) | **[-π, +π]** | **3.022** | **0.7356** | **Forcé à 0 dans CEM** |
+| 4 | Rotation axis 2 | [-0.53, 0.76] | 0.308 | 0.0241 | **Forcé à 0 dans CEM** |
+| 5 | Rotation axis 3 | [-1.59, 0.63] | 0.558 | 0.0177 | **Forcé à 0 dans CEM** |
+| 6 | Gripper [0=fermé] | [0.0, 0.99] | 0.377 | 0.0241 | Clamp ±0.75, std=1.0 |
+
+**Point clé** : Meta ne planifie que xyz + gripper. Les rotations (indices 3,4,5) sont **forcées à zéro** dans `mpc_utils.py:98-104`. Le joint 3 (std_delta=0.74) représente une rotation complète ±π — jamais planifiée par le CEM.
+
+**Règle implicite Meta** : `maxnorm ≈ 3 × std_delta` pour les dimensions planifiées.
+- xyz : std_delta ≈ 0.006-0.016 → maxnorm = 0.05 ≈ 3×0.016 ✅
+
+**Les actions dans lerobot/droid_100 sont des cibles absolues** (pas des deltas), contrairement au CEM Meta qui travaille en deltas. Ce sont deux espaces différents.
+
+#### SO-101 (azaracla/community_dataset_v1_aggregated, 30fps natif → 4fps effectif, joint space 6D)
+
+Stats mesurées sur le dataset complet :
+
+| Index | Interprétation | Delta std naïf¹ | Delta std correct² | 3×std (maxnorm) |
+|-------|---------------|----------------|-------------------|-----------------|
+| 0 | Shoulder Pan | 0.292 | **0.450** | 1.35 |
+| 1 | Shoulder Lift | 0.919 | **1.010** | 3.03 |
+| 2 | Elbow Flex | 0.851 | **0.874** | 2.62 |
+| 3 | Wrist Flex | 0.273 | **0.342** | 1.03 |
+| 4 | Wrist Roll | 0.487 | **0.578** | 1.74 |
+| 5 | Gripper (servo) | 0.280 | **0.421** | 1.26 |
+
+¹ Script naïf `states[1:] - states[:-1]` sur 1000 frames, traverse les frontières d'épisodes → sous-estimé ~30%
+² Intra-épisode uniquement, 100 épisodes, 41878 frames (`dataset_from_index` → `dataset_to_index`)
+
+**Différences fondamentales avec DROID :**
+1. **Joint space vs end-effector** : les deltas SO-101 sont en radians/step, pas en mètres/frame. Les échelles sont incomparables.
+2. **4fps effectif vs 15fps** : nos deltas couvrent ~0.267s de mouvement (8 frames à 30fps), soit 4× plus que DROID. Deltas naturellement plus grands.
+3. **Gripper SO-101 = servo continu** (std=0.28, similaire aux autres joints) vs gripper DROID = commande binaire (range [-1,1], std~1.0). La logique gripper spéciale de Meta est inapplicable ici.
+4. **Joints 1,2 (épaule, coude) sont 3× plus dynamiques** que les autres — le `cem_maxnorm=0.05` uniforme de Meta les clippe à ~17% de leur std, rendant le CEM aveugle sur ces dimensions.
+
+### 13.2 Fix appliqué
+
+**Règle** : `cem_std_per_joint = std(deltas)`, `cem_maxnorm_per_joint = 3 × std(deltas)` (même règle que Meta pour xyz).
+
+```python
+# configuration_vjepa_ac.py — nouvelles options
+cem_std_per_joint: list[float] | None = None    # override cem_std si set
+cem_maxnorm_per_joint: list[float] | None = None  # override cem_maxnorm si set
+cem_std: float = 0.05    # corrigé : était 0.5 (bug R1), maintenant = maxnorm comme Meta
+cem_maxnorm: float = 0.05
+
+# select_action() — clamp per-joint vectorisé
+if self.config.cem_maxnorm_per_joint is not None:
+    maxnorm = torch.tensor(self.config.cem_maxnorm_per_joint, device=device)  # [D]
+actions = torch.clamp(actions, -maxnorm, maxnorm)  # broadcast sur [N, H, D]
+```
+
+```yaml
+# vjepa_ac.yaml — valeurs calibrées SO-101 (intra-épisode, 100 eps, 41878 frames)
+cem_std_per_joint: [0.45, 1.01, 0.87, 0.34, 0.58, 0.42]
+cem_maxnorm_per_joint: [1.35, 3.03, 2.62, 1.03, 1.74, 1.26]
+```
+
+### 13.3 Préparation des données : Meta DROID vs notre SO-101
+
+#### Comment Meta charge les données (`vjepa2/app/vjepa_droid/droid.py`)
+
+```python
+# droid.py — chargement des states
+states = cartesian_position + gripper_position  # concaténation brute, unités SI (mètres)
+# Pas de normalisation. Les Franka sont calibrés en usine → ranges universels.
+
+# Calcul des deltas au runtime (comme nous)
+actions = self.poses_to_diffs(states)
+# Pour xyz : simple soustraction
+# Pour rotation : composition de matrices R[t+1] @ R[t].T (correct géométriquement)
+
+# Sous-échantillonnage temporel
+states = states[indices][::self.frameskip]  # fps puis tubelet_size skip
+```
+
+| Aspect | Meta DROID (`droid.py`) | Notre SO-101 |
+|--------|------------------------|--------------|
+| Unités states | Mètres (cartésien absolu) | Degrés (joint space, relatif à calibration) |
+| Normalisation states | **Aucune** (SI universel) | **MIN_MAX** (ranges asymétriques, cross-robot) |
+| Normalisation actions (deltas) | **Aucune** | **IDENTITY** (delta stats ≠ absolute stats) |
+| Calcul deltas | Runtime `poses_to_diffs()` | Runtime `StateToDeltaActionProcessorStep` |
+| Rotation deltas | `R[t+1] @ R[t].T` (composition matricielle) | Simple soustraction degrés (pas de rotations carte) |
+| ImageNet norm | Oui (`mean/std` ImageNet) | Oui (identique) |
+| Calibration cross-robot | Pas nécessaire (Franka usine) | Nécessaire (STS3215 calibrés individuellement) |
+
+#### Pourquoi notre MIN_MAX sur les states est correct
+
+Les moteurs STS3215 du SO-101 sont calibrés **individuellement par robot** en position relative (degrés depuis position de repos). Cela signifie :
+- Les ranges absolus varient d'un robot à l'autre (ex: shoulder_pan peut aller de -90° à +90° ou de -120° à +70° selon la calibration)
+- Certains joints ont des ranges très asymétriques (ex: shoulder_lift [-10°, 110°])
+- La normalisation MIN_MAX homogénéise ces disparités → le `state_encoder` voit toujours [-1, 1]
+
+Meta n'a pas ce problème : les Franka industriels ont une calibration usine, les positions cartésiennes en mètres sont directement comparables d'un robot à l'autre.
+
+#### Pourquoi IDENTITY sur les actions (deltas) est correct
+
+Les stats du dataset LeRobot (`stats["action"]`) correspondent aux **actions absolues** stockées dans le dataset (cibles articulaires). La normalisation MIN_MAX apprendrait à normaliser `a_k = s_{k+1} - s_k` avec les min/max de `s_k` — sémantiquement incorrect (les deltas ont une distribution centrée sur 0, pas sur la plage d'opération).
+
+Meta n'utilise pas non plus de normalisation sur ses deltas — `poses_to_diffs()` retourne directement les valeurs brutes en mètres.
+
+---
+
+### 13.4 Pourquoi la normalisation est critique ici
+
+Le predictor reçoit les actions via `action_encoder` (Linear 6→1024). Si les deltas entrent dans des échelles très différentes (0.27 pour wrist vs 0.92 pour shoulder), le gradient qui revient sur les premières dimensions de la matrice de poids est ~3× plus grand. Le réseau apprend à ignorer les joints lents et à sur-fitter les joints rapides.
+
+Sans normalisation des actions (on utilise `IDENTITY` intentionnellement car delta stats ≠ absolute stats), c'est le CEM qui doit explorer dans le bon espace. Si le CEM utilise `cem_std=0.05` pour tous les joints, il explore seulement 17% de la dynamique réelle des joints 1,2 — ces joints ne participent presque pas à l'optimisation de la trajectoire.
+
+Avec `cem_std_per_joint` calibré sur les stats du dataset :
+- Le CEM explore proportionnellement à la dynamique de chaque joint
+- Les elites sélectionnées sont représentatives de ce que le robot peut faire
+- La `mu` finale converge vers une action cohérente avec la distribution des données d'entraînement
+
+---
+
+## 12. AUDIT DE RELECTURE (2026-04-09)
+
+Relecture complète post-corrections, comparaison avec l'original `vjepa2/` et `mpc_utils.py`.
+
+### 12.1 Bugs trouvés
+
+| # | Sévérité | Fichier | Problème | Détail |
+|---|----------|---------|----------|--------|
+| R1 | **CRITIQUE (inférence)** | `configuration_vjepa_ac.py:46` | `cem_std=0.5` avec `cem_maxnorm=0.05` | Tous les samples CEM sont clampés à ±0.05 — le CEM dégénère en recherche uniforme aléatoire. Avec `cem_momentum_std=0.95` et seulement 3 itérations (YAML), la std ne converge jamais. L'original Meta utilise `std = maxnorm = 0.05` (`mpc_utils.py:77`). **Fix : `cem_std: 0.05`** |
+| R2 | Latent | `ac_predictor_utils.py:487` | `_rescale_blocks` crash si SwiGLU activé | `rescale(layer.mlp.fc2.weight.data, ...)` — `SwiGLUFFN` utilise `.fc3` comme couche de sortie, pas `.fc2` (qui est la branche gate). Bug hérité de l'original Meta (`ac_predictor.py:134`), inactif avec GELU (config actuelle). |
+| R3 | Cosmétique | `modeling_vjepa_ac.py:309+311` | Double assignation `images = batch[image_key]` | Code dupliqué, inoffensif |
+| R4 | Cosmétique | `modeling_vjepa_ac.py:385,399` | Code `extrinsics` mort | `extrinsics = None` toujours, le code de slicing est inatteignable |
+
+### 12.2 Différences vérifiées (pas des bugs)
+
+| Aspect | Notre implémentation | Original Meta | Verdict |
+|--------|---------------------|---------------|---------|
+| States normalisés | MIN_MAX [-1, 1] via preprocessor | Raw (pas de normalisation) | Choix valide — `state_encoder` apprend sur des states normalisés, cohérent train/infer. Aide pour joint space SO-101 avec ranges non-uniformes |
+| CEM momentum | `momentum_mean=0.25, momentum_std=0.95` | Identique | ✅ |
+| CEM structure actions | Uniform 6D (joints SO-101) | Structuré xyz(3D) + gripper(1D) séparés, rotation zéro | Adaptation correcte au joint space |
+| Formule loss | `torch.abs(z - h) ** loss_exp / loss_exp` | `torch.mean(torch.abs(z - h) ** loss_exp) / loss_exp` | Identique (notre code fait `.mean()` au retour de `loss_fn`) |
+| Auto-regressive bounds | `auto_steps=2`, boucle `range(1, 2)` avec T=4 | `auto_steps=2`, boucle `range(1, 2)` avec T=8 | ✅ Même logique, adapté à notre T |
+
+### 12.3 Refactor appliqué : suppression `_DELTA_STATE_CACHE`
+
+Le global `_DELTA_STATE_CACHE` (anti-pattern : état mutable partagé entre pipelines) a été supprimé et remplacé par deux mécanismes :
+
+1. **raw_deltas → modèle** : `StateToDeltaActionProcessorStep` écrit `observation.raw_deltas` dans la transition. `select_action()` lit `batch["observation.raw_deltas"]`. Best practice LeRobot : tout passe par le batch.
+
+2. **current_state → postprocessor** : Ref directe `preprocessor=delta_step` entre steps co-créés dans `make_vjepa_ac_pre_post_processors()`. Nécessaire car le postprocessor LeRobot ne reçoit qu'un `PolicyAction` tensor (pas le batch d'entrée). `RuntimeError` explicite si ref manquante.
 
 ---
 
 ## 10. RÉSUMÉ
 
 L'intégration architecturale dans LeRobot est **solide** — le predictor est un portage fidèle, le pipeline processor est bien conçu, et les abstractions LeRobot sont correctement utilisées. Les problèmes identifiés sont principalement au niveau de **la cohérence entre entraînement et inférence** (action space mismatch, horizon mismatch, auto_steps) et des **hyperparamètres CEM inadaptés au joint space** SO-101. Ce sont des problèmes corrigeables sans refonte architecturale.
+
+**Post-relecture (2026-04-09)** : Toutes les corrections P0/P1 sont validées. Le seul bug critique restant est `cem_std=0.5` (R1) qui rend le CEM dégénéré à l'inférence — fix trivial (`cem_std: 0.05`). L'entraînement n'est pas affecté par ce paramètre.
