@@ -82,6 +82,29 @@ def _reconnect_relative_absolute_steps(
             step.relative_step = relative_step
 
 
+def _reconnect_vjepa_ac_steps(
+    preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
+) -> None:
+    """Wire DeltaToAbsoluteActionProcessorStep._preprocessor to StateToDeltaActionProcessorStep after deserialization.
+
+    Mirrors _reconnect_relative_absolute_steps for the VJEPA-AC delta-action pattern.
+    """
+    try:
+        from lerobot_policy_vjepa_ac.processor_vjepa_ac import (
+            DeltaToAbsoluteActionProcessorStep,
+            StateToDeltaActionProcessorStep,
+        )
+    except ImportError:
+        return
+
+    delta_step = next((s for s in preprocessor.steps if isinstance(s, StateToDeltaActionProcessorStep)), None)
+    if delta_step is None:
+        return
+    for step in postprocessor.steps:
+        if isinstance(step, DeltaToAbsoluteActionProcessorStep) and step._preprocessor is None:
+            step._preprocessor = delta_step
+
+
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """
     Retrieves a policy class by its registered name.
@@ -311,6 +334,7 @@ def make_pre_post_processors(
             to_output=transition_to_policy_action,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        _reconnect_vjepa_ac_steps(preprocessor, postprocessor)
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type

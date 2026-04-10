@@ -2,7 +2,7 @@
 
 seed: 42
 
-output_dir: outputs/vjepa_ac/run_20260408
+output_dir: outputs/vjepa_ac/run_20260409
 
 dataset:
   repo_id: azaracla/community_dataset_v1_aggregated
@@ -21,7 +21,7 @@ dataset:
           ratio: [0.75, 1.35]
           target_size: 384  # Match vjepa2.1 native resolution
 
-batch_size: 4
+batch_size: 2
 num_workers: 1
 steps: 50000
 tolerance_s: 1e-3
@@ -43,8 +43,8 @@ policy:
   encoder_repo_id: "facebookresearch/vjepa2"
   action_dim: 6
   img_size: 384
-  num_frames: 4  # Minimized for RAM
-  n_obs_steps: 4  # Minimized for RAM
+  num_frames: 6
+  n_obs_steps: 6
   vfps: 30  # Original video FPS
   fps: 4  # 2 frames apart
   use_amp: true
@@ -74,13 +74,18 @@ policy:
 
 optimizer:
   type: adamw
-  lr: 1e-5  # Scaled from paper: 4.25e-4 * (2/256)
-  weight_decay: 0.04  # Match DROID paper
+  lr: 1e-5
+  weight_decay: 0.04
+  grad_clip_norm: 10.0
 
 scheduler:
-  type: diffuser
-  name: cosine
-  num_warmup_steps: 4500  # Match DROID paper
+  type: wsd
+  num_warmup_steps: 500     # court warmup pour stabiliser après reprise
+  num_stable_steps: 45000   # longue phase stable : c'est là que le modèle apprend
+  num_anneal_steps: 4500
+  start_lr: 7.5e-6          # repart doucement
+  peak_lr: 1e-5             # même peak qu'avant
+  final_lr: 0.0
 
 wandb:
   enable: true

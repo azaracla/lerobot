@@ -765,3 +765,52 @@ Le global `_DELTA_STATE_CACHE` (anti-pattern : état mutable partagé entre pipe
 L'intégration architecturale dans LeRobot est **solide** — le predictor est un portage fidèle, le pipeline processor est bien conçu, et les abstractions LeRobot sont correctement utilisées. Les problèmes identifiés sont principalement au niveau de **la cohérence entre entraînement et inférence** (action space mismatch, horizon mismatch, auto_steps) et des **hyperparamètres CEM inadaptés au joint space** SO-101. Ce sont des problèmes corrigeables sans refonte architecturale.
 
 **Post-relecture (2026-04-09)** : Toutes les corrections P0/P1 sont validées. Le seul bug critique restant est `cem_std=0.5` (R1) qui rend le CEM dégénéré à l'inférence — fix trivial (`cem_std: 0.05`). L'entraînement n'est pas affecté par ce paramètre.
+
+---
+
+## 14. REFACTORING PROCESSOR PIPELINE (2026-04-09)
+
+### 14.1 Pourquoi delta actions et non relative actions (LeRobot PR #2970)
+
+LeRobot PR #2970 introduit `RelativeActionsProcessorStep` (terminologie UMI) avec la sémantique :
+```
+action[k] = target_pos[k] - s_0   # offset depuis l'état courant, même référence pour tout le chunk
+```
+
+VJEPA-AC utilise une sémantique **différente** (convention DROID, section 3.1 du papier) :
+```
+a_k = s_{k+1} - s_k   # diff séquentielle entre frames adjacentes
+```
+
+**Pourquoi cette différence est architecturale** : le predictor VJEPA-AC est autorégressif — il reçoit `(a_k, s_k, z_k)` et prédit `z_{k+1}`. Le token d'action doit encoder la **transition locale** entre l'état courant et le suivant. Avec des relative actions, `a_k` encoderait le déplacement cumulatif depuis `s_0` — redondant avec les `s_k` déjà dans le contexte et pas directement utile pour prédire le prochain frame.
+
+Les relative actions conviennent aux policies qui prédisent un chunk entier depuis un état fixe (UMI, π₀). Les delta actions conviennent aux predictors frame-à-frame autorégressifs (VJEPA-AC).
+
+On ne peut donc **pas** utiliser `RelativeActionsProcessorStep` directement — les steps calculent et invertissent avec la mauvaise sémantique.
+
+### 14.2 Limitation architecturale du postprocessor LeRobot
+
+Le postprocessor LeRobot ne reçoit qu'un `PolicyAction` tensor (pas le batch d'entrée complet). Pour convertir delta→absolu en postprocessing, il faut accéder au `current_state` capturé par le preprocessor — d'où le couplage entre steps.
+
+Anti-patterns évalués et rejetés :
+- `_DELTA_STATE_CACHE` global → état mutable partagé (section 12.3)
+- `state_cache = {}` closure → même anti-pattern sous un autre nom
+
+### 14.3 Solution retenue : pattern LeRobot (_reconnect_vjepa_ac_steps)
+
+Le pattern officiel LeRobot (PR #2970) utilise une ref directe entre steps, re-câblée après désérialisation dans `factory.py`. On suit exactement ce pattern pour les steps VJEPA-AC.
+
+**Pipeline final** :
+```
+Rename(0) → AddBatch(1) → StateToDeltaActionProcessorStep(2) → DeviceProcessorStep(3) → NormalizerProcessorStep(4)
+```
+
+`StateToDeltaActionProcessorStep` s'exécute **avant** `DeviceProcessorStep` (comme upstream) — `_current_state` est caché sur CPU, `DeltaToAbsoluteActionProcessorStep` gère la conversion device/dtype au moment de l'utilisation.
+
+**Fichiers modifiés** :
+
+| Fichier | Changement |
+|---|---|
+| `processor_vjepa_ac.py` | `VjepaAcDeviceAndDeltaStep` → `StateToDeltaActionProcessorStep` (delta seul, sans device). Ajout `RAW_CURRENT_STATE_KEY`. Fix device mismatch dans `DeltaToAbsoluteActionProcessorStep`. |
+| `src/lerobot/policies/factory.py` | Ajout `_reconnect_vjepa_ac_steps()`, appelé après `_reconnect_relative_absolute_steps` dans `make_pre_post_processors()`. |
+| `src/lerobot/async_inference/policy_server.py` | Suppression `_load_dataset_stats()` — les stats sont chargées automatiquement via `state_file` dans le JSON du pipeline (comportement upstream). |

@@ -19,8 +19,9 @@ from lerobot.types import TransitionKey
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 from .configuration_vjepa_ac import VjepaAcConfig
 
-# Keys used to pass data through the transition (batch) between processor steps and the model.
+# Keys used to pass data through the transition between processor steps and the model.
 RAW_DELTAS_KEY = "observation.raw_deltas"
+RAW_CURRENT_STATE_KEY = "observation.raw_current_state"
 
 
 @ProcessorStepRegistry.register(name="vjepa_ac_logging_processor")
@@ -57,8 +58,7 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
 
         observation = transition.get("observation", {})
         complementary = transition.get("complementary_data", {})
-        
-        # Recherche du timestamp réel ou reconstruction via l'index
+
         timestamps = None
         for target in [observation, transition, complementary]:
             for key in ["timestamp", "timestamps", "observation.timestamp"]:
@@ -75,7 +75,6 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
             else:
                 ts_batch0 = [timestamps.item()]
         elif "index" in complementary:
-            # Reconstruction : index de base + deltas / FPS
             base_idx = complementary["index"][0].item()
             ts_batch0 = [(base_idx + d) / self.vfps for d in self.delta_indices]
 
@@ -98,16 +97,12 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """Returns features unchanged - this is just for logging."""
         return features
 
     def _save_image(self, tensor: torch.Tensor, key: str, step: int, timestamps=None):
-        """Sauvegarde une planche contact de la séquence temporelle avec timestamps."""
         import PIL.Image
         import PIL.ImageDraw
-        import torch
 
-        # tensor shape: [T, C, H, W] ou [C, H, W]
         if tensor.ndim == 3:
             frames = [tensor]
         else:
@@ -115,32 +110,28 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
 
         processed_frames = []
         for i, img in enumerate(frames):
-            # [C, H, W] -> [H, W, C]
             if img.ndim == 3:
-                if img.shape[0] in [1, 3]: # C est en premier
+                if img.shape[0] in [1, 3]:
                     img = img.permute(1, 2, 0)
-            
-            if img.shape[-1] == 1: # Grayscale
+
+            if img.shape[-1] == 1:
                 img = img.squeeze(-1)
 
             img_np = img.detach().cpu().numpy()
-            
-            # Normalisation (0-1 -> 0-255)
+
             if img_np.max() <= 1.01:
                 img_np = (img_np * 255).astype(np.uint8)
             else:
                 img_np = img_np.astype(np.uint8)
-            
+
             pil_img = PIL.Image.fromarray(img_np)
-            
-            # Incrustation du timestamp
+
             if timestamps is not None and i < len(timestamps):
                 draw = PIL.ImageDraw.Draw(pil_img)
                 ts_text = f"{float(timestamps[i]):.2f}s"
-                # Dessiner un petit rectangle noir derrière le texte pour la lisibilité
                 draw.rectangle([5, 5, 60, 20], fill="black")
                 draw.text((10, 7), ts_text, fill="white")
-            
+
             processed_frames.append(pil_img)
 
         if not processed_frames:
@@ -148,7 +139,7 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
 
         w, h = processed_frames[0].size
         contact_sheet = PIL.Image.new("RGB", (w * len(processed_frames), h))
-        
+
         for i, frame in enumerate(processed_frames):
             contact_sheet.paste(frame, (i * w, 0))
 
@@ -158,77 +149,28 @@ class VjepaAcLoggingProcessorStep(ProcessorStep):
         )
 
 
-@ProcessorStepRegistry.register(name="vjepa_ac_device_and_delta")
-@ProcessorStepRegistry.register(name="device_processor")  # alias for policy_server override compat
-class VjepaAcDeviceAndDeltaStep(ProcessorStep):
+@ProcessorStepRegistry.register(name="vjepa_ac_state_to_delta")
+class StateToDeltaActionProcessorStep(ProcessorStep):
     """
-    Fused step: device placement + state-to-delta-action computation.
+    Preprocessor: computes sequential state deltas from multi-frame state observations.
 
-    Replaces the separate DeviceProcessorStep + StateToDeltaActionProcessorStep pair,
-    keeping the NormalizerProcessorStep at step index 3 (as expected by LeRobot's
-    policy_server which hardcodes that index for loading normalizer stats).
+    Reads observation.state [B, T, D], writes:
+      - observation.raw_deltas        [B, T-1, D]  = state[:, 1:] - state[:, :-1]
+      - observation.raw_current_state [B, D]        = state[:, -1]
 
-    Pipeline:
-      step 0: RenameObservationsProcessorStep
-      step 1: AddBatchDimensionProcessorStep
-      step 2: VjepaAcDeviceAndDeltaStep  ← this class (Device + Delta)
-      step 3: NormalizerProcessorStep    ← always step_3 for policy_server compat
-
-    Device logic mirrors DeviceProcessorStep exactly. Delta logic:
-      - Computes raw_deltas = state[:, 1:] - state[:, :-1]  [B, T-1, D]
-      - Writes raw_deltas into observation dict under RAW_DELTAS_KEY
-      - Replaces ACTION tensor with raw_deltas (training mode)
-      - Caches _current_state for the paired postprocessor
+    Also replaces the ACTION tensor with raw_deltas (training mode only).
+    Caches _current_state for the paired DeltaToAbsoluteActionProcessorStep.
     """
 
-    def __init__(self, device: str = "cpu", use_delta_actions: bool = True):
-        from lerobot.utils.device_utils import get_safe_torch_device
-        self.device = device
+    def __init__(self, use_delta_actions: bool = True):
         self.use_delta_actions = use_delta_actions
-        self.tensor_device = get_safe_torch_device(device)
-        self.device = self.tensor_device.type
-        self.non_blocking = "cuda" in str(self.device)
         self._current_state: torch.Tensor | None = None
 
-    def _to_device(self, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.is_cuda and self.tensor_device.type == "cuda":
-            target_device = tensor.device
-        else:
-            target_device = self.tensor_device
-        if tensor.device != target_device:
-            tensor = tensor.to(target_device, non_blocking=self.non_blocking)
-        return tensor
-
     def __call__(self, transition: dict[str, Any]) -> dict[str, Any]:
-        new_transition = transition.copy()
-
-        # --- Device placement (mirrors DeviceProcessorStep) ---
-        simple_tensor_keys = [
-            TransitionKey.ACTION,
-            TransitionKey.REWARD,
-            TransitionKey.DONE,
-            TransitionKey.TRUNCATED,
-        ]
-        dict_tensor_keys = [
-            TransitionKey.OBSERVATION,
-            TransitionKey.COMPLEMENTARY_DATA,
-        ]
-        for key in simple_tensor_keys:
-            value = new_transition.get(key)
-            if isinstance(value, torch.Tensor):
-                new_transition[key] = self._to_device(value)
-        for key in dict_tensor_keys:
-            data_dict = new_transition.get(key)
-            if data_dict is not None:
-                new_transition[key] = {
-                    k: self._to_device(v) if isinstance(v, torch.Tensor) else v
-                    for k, v in data_dict.items()
-                }
-
         if not self.use_delta_actions:
-            return new_transition
+            return transition
 
-        # --- Delta computation ---
+        new_transition = transition.copy()
         obs = new_transition.get(TransitionKey.OBSERVATION, {})
         state = obs.get("observation.state")  # [B, T, D]
 
@@ -236,7 +178,11 @@ class VjepaAcDeviceAndDeltaStep(ProcessorStep):
             return new_transition
 
         if state.ndim == 2:
-            self._current_state = state  # [B, D] — single frame, cache only
+            # Single frame — cache state, no deltas to compute
+            self._current_state = state  # [B, D]
+            obs = dict(obs)
+            obs[RAW_CURRENT_STATE_KEY] = state
+            new_transition[TransitionKey.OBSERVATION] = obs
             return new_transition
 
         # state: [B, T, D]
@@ -245,6 +191,7 @@ class VjepaAcDeviceAndDeltaStep(ProcessorStep):
 
         obs = dict(obs)
         obs[RAW_DELTAS_KEY] = raw_deltas
+        obs[RAW_CURRENT_STATE_KEY] = self._current_state
         new_transition[TransitionKey.OBSERVATION] = obs
 
         action = new_transition.get(TransitionKey.ACTION)
@@ -259,7 +206,7 @@ class VjepaAcDeviceAndDeltaStep(ProcessorStep):
         return features
 
     def get_config(self) -> dict[str, Any]:
-        return {"device": self.device, "use_delta_actions": self.use_delta_actions}
+        return {"use_delta_actions": self.use_delta_actions}
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         return {}
@@ -277,13 +224,17 @@ class DeltaToAbsoluteActionProcessorStep(ProcessorStep):
     Postprocessor: converts delta action sequence (model output) back to absolute
     joint targets by adding the cached current state from the paired preprocessor.
 
+    Follows the LeRobot pattern (RelativeActionsProcessorStep / AbsoluteActionsProcessorStep):
+    the reference to the paired preprocessor is non-serializable and must be re-established
+    after deserialization via _reconnect_vjepa_ac_steps() in factory.py.
+
     delta_actions: [B, H, D]  (output of CEM, already unnormalized)
     absolute:      [B, H, D]  cumulative sum starting from current_state
       absolute[:, 0] = current_state + delta[:, 0]
       absolute[:, k] = current_state + sum(delta[:, 0:k+1])
     """
 
-    def __init__(self, preprocessor: "VjepaAcDeviceAndDeltaStep | None" = None):
+    def __init__(self, preprocessor: "StateToDeltaActionProcessorStep | None" = None):
         self._preprocessor = preprocessor
 
     def __call__(self, transition: dict[str, Any]) -> dict[str, Any]:
@@ -295,13 +246,16 @@ class DeltaToAbsoluteActionProcessorStep(ProcessorStep):
             raise RuntimeError(
                 "DeltaToAbsoluteActionProcessorStep requires a reference to the paired "
                 "StateToDeltaActionProcessorStep. Use make_vjepa_ac_pre_post_processors() "
-                "to create both steps together."
+                "to create both steps together, or call _reconnect_vjepa_ac_steps() after loading."
             )
         current_state = getattr(self._preprocessor, "_current_state", None)
         if current_state is None:
             return transition
 
-        # action: [B, H, D], current_state: [B, D]
+        # Align device/dtype (current_state was cached before DeviceProcessorStep)
+        if current_state.device != action.device or current_state.dtype != action.dtype:
+            current_state = current_state.to(device=action.device, dtype=action.dtype)
+
         if action.ndim == 2:
             # [B, D] single-step delta
             absolute = current_state + action
@@ -344,32 +298,26 @@ def make_vjepa_ac_pre_post_processors(
     if config.use_delta_actions:
         norm_map["ACTION"] = NormalizationMode.IDENTITY
 
-    # VjepaAcDeviceAndDeltaStep fuses Device + Delta into a single step so that
-    # NormalizerProcessorStep is always at index 3, matching the hardcoded index
-    # in LeRobot's policy_server._load_dataset_stats().
-    device_and_delta_step = VjepaAcDeviceAndDeltaStep(
-        device=config.device,
-        use_delta_actions=config.use_delta_actions,
-    )
+    delta_step = StateToDeltaActionProcessorStep(use_delta_actions=config.use_delta_actions)
 
+    # Pipeline order mirrors the LeRobot relative-action pattern (PR #2970):
+    #   delta_step runs before DeviceProcessorStep so _current_state is cached on CPU,
+    #   matching the device where state was received. DeltaToAbsoluteActionProcessorStep
+    #   handles the device mismatch at postprocess time.
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-        device_and_delta_step,  # step 2: Device + Delta (fused)
-    ]
-
-    input_steps.append(  # step 3: Normalizer — always at index 3
+        delta_step,
+        DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=norm_map,
             stats=dataset_stats,
             device=config.device,
-        )
-    )
+        ),
+    ]
 
     if config.log_observation_images:
-        # Inserting at 0 shifts all steps — NormalizerProcessorStep moves to step 4.
-        # This is acceptable: logging is a debug mode not used in production inference.
         input_steps.insert(
             0,
             VjepaAcLoggingProcessorStep(
@@ -389,7 +337,7 @@ def make_vjepa_ac_pre_post_processors(
     ]
 
     if config.use_delta_actions:
-        output_steps.append(DeltaToAbsoluteActionProcessorStep(preprocessor=device_and_delta_step))
+        output_steps.append(DeltaToAbsoluteActionProcessorStep(preprocessor=delta_step))
 
     output_steps.append(DeviceProcessorStep(device="cpu"))
 
