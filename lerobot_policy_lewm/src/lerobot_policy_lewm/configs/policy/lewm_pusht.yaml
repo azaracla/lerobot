@@ -1,0 +1,54 @@
+# LeWM JEPA world model config for PushT
+# @package _global_
+#
+# Usage: lerobot-train --policy.type=lewm --policy.path=...
+
+policy:
+  type: lewm
+
+  # Model architecture (ViT-Tiny + AR predictor, ~15M params)
+  img_size: 224
+  patch_size: 14
+  embed_dim: 192
+  encoder_depth: 12
+  encoder_heads: 3
+
+  predictor_depth: 6
+  predictor_heads: 16
+  predictor_mlp_dim: 2048
+  predictor_dim_head: 64
+
+  proj_hidden_dim: 2048
+  action_emb_dim: 192
+
+  # Temporal structure
+  n_obs_steps: 4
+  num_preds: 1
+
+  # Loss
+  sigreg_weight: 0.09
+  sigreg_knots: 17
+  sigreg_num_proj: 1024
+
+  # MPC / Planning
+  horizon: 5
+  cem_num_samples: 300
+  cem_n_steps: 30
+  cem_topk: 30
+  cem_var_scale: 1.0
+
+  # Normalization
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MIN_MAX
+    ACTION: MIN_MAX
+
+  # Optimizer (AdamW, 5e-5 lr, 1e-3 wd — matches LeWM paper)
+  optimizer_lr: 5.0e-5
+  optimizer_weight_decay: 1.0e-3
+  scheduler_warmup_steps: 500
+  scheduler_name: cosine
+
+  # Training
+  use_amp: false
+  device: null  # auto-detect

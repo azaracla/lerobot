@@ -176,3 +176,13 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Plugin outputs and checkpoints
+lerobot_policy_*/outputs/
+lerobot_policy_*/wandb/
+
+# External repos and data
+vjepa2/
+my_datasets/
+test_lerobot_policy_ditflow/
+outputs/
