@@ -131,7 +131,7 @@ class Attention(nn.Module):
 
         out = F.scaled_dot_product_attention(q, k, v, is_causal=(context is None))
         out = out.transpose(1, 2).reshape(*x.shape[:-1], -1)
-        return self.to_out(out) + x  # residual
+        return self.to_out(out)
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +153,12 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
         self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.attn(x)
-        x = x + self.mlp(x)
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -169,10 +171,11 @@ class ConditionalBlock(nn.Module):
     """Transformer block with AdaLN-Zero conditioning on action embeddings.
 
     The condition vector is projected into 6 modulation parameters:
-        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp.
 
-    The final linear layer in each sub-block is zero-initialized so that
-    at initialization the block behaves as identity.
+    Only the adaLN modulation projection is zero-initialized (as in DiT/LeWM).
+    Attention and MLP paths keep standard init so gate gradients can flow.
+    At t=0: gate=0 → identity + normally-initialized sub-blocks → gradients flow.
     """
 
     def __init__(
@@ -188,17 +191,15 @@ class ConditionalBlock(nn.Module):
         self.dim = dim
         inner_dim = dim_head * heads
 
-        # Attention sub-block
+        # Attention sub-block (standard init, NOT zero — gradients flow through gate)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout),
         )
-        nn.init.zeros_(self.to_out[0].weight)
-        nn.init.zeros_(self.to_out[0].bias)
 
-        # MLP sub-block
+        # MLP sub-block (standard init, NOT zero)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
@@ -207,17 +208,17 @@ class ConditionalBlock(nn.Module):
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
-        nn.init.zeros_(self.mlp[-2].weight)
-        nn.init.zeros_(self.mlp[-2].bias)
 
         # Modulation projection: cond -> 6 * dim
+        # Zero-init weight + bias as in original LeWM / DiT AdaLN-zero design.
+        # Gates start at 0, but gradients flow through gate because attn/mlp
+        # outputs are non-zero (standard init). Gates gradually open.
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(cond_dim, 6 * dim, bias=True),
         )
-        # Zero-init modulation projection
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
         self.heads = heads
         self.dim_head = dim_head
@@ -328,13 +329,13 @@ class Transformer(nn.Module):
 
 
 class MLP(nn.Module):
-    """Two-layer MLP with LayerNorm and GELU activation.
+    """Two-layer MLP with configurable normalization and GELU activation.
 
     Used as projector/pred_proj in JEPA: projects encoder CLS tokens
     to the prediction space and back.
 
-    Uses LayerNorm (not BatchNorm) for robustness to batch_size=1
-    during inference (common in robotics).
+    Uses configurable normalization (default: LayerNorm).
+    The original le-wm uses BatchNorm1d for training-time regularization.
 
     Expects input of shape (B*T, D).
     """
@@ -345,13 +346,17 @@ class MLP(nn.Module):
         hidden_dim: int,
         output_dim: int,
         norm: bool = True,
+        norm_fn=None,
     ):
         super().__init__()
         layers = [
             nn.Linear(input_dim, hidden_dim),
         ]
         if norm:
-            layers.append(nn.LayerNorm(hidden_dim))
+            if norm_fn is not None:
+                layers.append(norm_fn(hidden_dim))
+            else:
+                layers.append(nn.LayerNorm(hidden_dim))
         layers.extend([
             nn.GELU(),
             nn.Linear(hidden_dim, output_dim),
@@ -372,27 +377,33 @@ class Embedder(nn.Module):
 
     Uses Conv1d (kernel=1) + 2-layer MLP with SiLU activation.
     Input: (B, T, action_dim), Output: (B, T, emb_dim).
+
+    Matches original le-wm module.Embedder exactly.
     """
 
     def __init__(
         self,
-        input_dim: int,
-        emb_dim: int,
+        input_dim: int = 10,
+        smoothed_dim: int = 10,
+        emb_dim: int = 10,
         mlp_scale: float = 4.0,
     ):
         super().__init__()
-        hidden_dim = int(emb_dim * mlp_scale)
-        self.conv = nn.Conv1d(input_dim, emb_dim, kernel_size=1)
-        self.mlp = nn.Sequential(
-            nn.Linear(emb_dim, hidden_dim),
+        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        self.embed = nn.Sequential(
+            nn.Linear(smoothed_dim, int(mlp_scale * emb_dim)),
             nn.SiLU(),
-            nn.Linear(hidden_dim, emb_dim),
+            nn.Linear(int(mlp_scale * emb_dim), emb_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, act_dim) -> (B, act_dim, T) -> (B, emb_dim, T) -> (B, T, emb_dim)
-        x = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        return self.mlp(x)
+        """x: (B, T, D)"""
+        x = x.float()
+        x = x.permute(0, 2, 1)
+        x = self.patch_embed(x)
+        x = x.permute(0, 2, 1)
+        x = self.embed(x)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -465,86 +476,33 @@ class ARPredictor(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class SIGReg(nn.Module):
-    """Sketch Isotropic Gaussian Regularizer.
+class SIGReg(torch.nn.Module):
+    """Sketch Isotropic Gaussian Regularizer (single-GPU!)
 
-    Encourages latent embeddings to follow a Gaussian distribution.
-    Uses random projections and the Epps-Pulley statistic.
-
-    Reference: LeWM paper, section on Gaussian regularization.
+    Exact copy from https://github.com/lucas-maes/le-wm (MIT License).
     """
 
-    def __init__(
-        self,
-        knots: int = 17,
-        num_proj: int = 1024,
-        embed_dim: int = 192,
-    ):
+    def __init__(self, knots=17, num_proj=1024):
         super().__init__()
-        self.knots = knots
         self.num_proj = num_proj
-        self.embed_dim = embed_dim
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
 
-        # Random projection matrix (fixed, not trained)
-        self.register_buffer(
-            "proj",
-            torch.randn(embed_dim, num_proj) / math.sqrt(embed_dim),
-        )
-
-        # Gaussian comparison window
-        self.register_buffer(
-            "gaussian_window",
-            self._build_gaussian_window(knots),
-        )
-
-    def _build_gaussian_window(self, knots: int) -> torch.Tensor:
-        """Compute Epps-Pulley statistic for a standard normal at each knot."""
-        z = torch.linspace(-3, 3, knots)
-        # CDF of standard normal at each knot
-        phi = 0.5 * (1 + torch.erf(z / math.sqrt(2)))
-        expected = (torch.arange(knots, dtype=torch.float32) + 0.5) / knots
-        return (phi - expected) ** 2
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute SIG regularization loss.
-
-        Args:
-            x: (T, B, D) — transposed embeddings (time-major).
-
-        Returns:
-            Scalar loss.
+    def forward(self, proj):
         """
-        T, B, D = x.shape
-
-        # Flatten across time and batch
-        x_flat = x.reshape(-1, D)  # (T*B, D)
-
-        # Random projection
-        projected = x_flat @ self.proj  # (T*B, num_proj)
-
-        # Sort each projection direction
-        sorted_proj, _ = projected.sort(dim=0)  # (T*B, num_proj)
-
-        # Reshape to match knot positions
-        N = sorted_proj.shape[0]
-        if N < self.knots:
-            return torch.tensor(0.0, device=x.device)
-
-        # Interpolate sorted values to knot positions
-        indices = torch.linspace(0, N - 1, self.knots, device=x.device).long()
-        knot_values = sorted_proj[indices]  # (knots, num_proj)
-
-        # Standardize: (value - mean) / std
-        mean = knot_values.mean(dim=0, keepdim=True)
-        std = knot_values.std(dim=0, keepdim=True) + 1e-8
-        knot_values = (knot_values - mean) / std
-
-        # Compare each projection to Gaussian CDF at knots
-        sorted_knots, _ = knot_values.sort(dim=0)
-        cdf_empirical = torch.linspace(0, 1, self.knots, device=x.device).unsqueeze(1)
-        expected = 0.5 * (1 + torch.erf(sorted_knots / math.sqrt(2)))
-
-        # Epps-Pulley statistic
-        stat = ((cdf_empirical - expected) ** 2).mean(dim=0)  # (num_proj,)
-
-        return stat.mean()
+        proj: (T, B, D)
+        """
+        # sample random projections
+        A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        A = A.div_(A.norm(p=2, dim=0))
+        # compute the epps-pulley statistic
+        x_t = (proj @ A).unsqueeze(-1) * self.t
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ self.weights) * proj.size(-2)
+        return statistic.mean() # average over projections and time

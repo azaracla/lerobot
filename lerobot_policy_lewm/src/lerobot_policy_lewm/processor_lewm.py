@@ -87,41 +87,53 @@ def make_lewm_pre_post_processors(
     """
     img_size = getattr(policy_cfg, "img_size", 224)
 
-    # Build preprocessor steps
-    pre_steps = [
-        ImagePreprocessorStep(target_size=img_size),
-    ]
+    # Build preprocessor steps.
+    # Include standard LeRobot steps (device, rename) for eval override compatibility.
+    pre_steps = []
+    post_steps = []
 
-    # Add LeRobot's standard normalizer if dataset_stats is available
     try:
-        from lerobot.processor.normalizer import (
+        from lerobot.processor.normalize_processor import (
             NormalizerProcessorStep,
             UnnormalizerProcessorStep,
         )
-        from lerobot.processor.device import DeviceProcessorStep
+        from lerobot.processor.device_processor import DeviceProcessorStep
+        from lerobot.processor.rename_processor import RenameObservationsProcessorStep
+
+        # Image resize + ImageNet norm
+        pre_steps.append(ImagePreprocessorStep(target_size=img_size))
+
+        # Standard steps required for lerobot-eval override compatibility
+        pre_steps.append(RenameObservationsProcessorStep(rename_map={}))
+        pre_steps.append(DeviceProcessorStep(device=policy_cfg.device))
 
         if dataset_stats is not None:
             normalizer = NormalizerProcessorStep(
                 stats=dataset_stats,
-                normalization_mapping=policy_cfg.normalization_mapping,
+                features={**policy_cfg.input_features, **policy_cfg.output_features},
+                norm_map=policy_cfg.normalization_mapping,
             )
             pre_steps.append(normalizer)
 
+            unnormalizer = UnnormalizerProcessorStep(
+                stats=dataset_stats,
+                features=policy_cfg.output_features,
+                norm_map=policy_cfg.normalization_mapping,
+            )
+            post_steps.append(unnormalizer)
+        else:
+            # Even without stats, unnormalizer is needed for eval compatibility
+            pass
+
         preprocessor = DataProcessorPipeline(
+            name="policy_preprocessor",
             steps=pre_steps,
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
         )
 
-        post_steps = []
-        if dataset_stats is not None:
-            unnormalizer = UnnormalizerProcessorStep(
-                stats=dataset_stats,
-                normalization_mapping=policy_cfg.normalization_mapping,
-            )
-            post_steps.append(unnormalizer)
-
         postprocessor = DataProcessorPipeline(
+            name="policy_postprocessor",
             steps=post_steps,
             to_transition=lambda x: {"action": x},
             to_output=lambda t: t["action"],
@@ -129,11 +141,13 @@ def make_lewm_pre_post_processors(
     except ImportError:
         # Fallback: minimal pipeline without LeRobot normalizers
         preprocessor = DataProcessorPipeline(
+            name="policy_preprocessor",
             steps=pre_steps,
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
         )
         postprocessor = DataProcessorPipeline(
+            name="policy_postprocessor",
             steps=[],
             to_transition=lambda x: {"action": x},
             to_output=lambda t: t["action"],

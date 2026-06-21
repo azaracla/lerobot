@@ -99,8 +99,25 @@ def main():
     policy.to(device).eval()
     policy.config.cem_num_samples = args.cem_samples
     policy.config.cem_n_steps = args.cem_iters
+    # CEM operates in normalized action space [-1, 1]; outputs are denormalized
+    # to raw action space by _denormalize_action() before env.step().
+    policy.config.cem_init_mean = 0.0
+    policy.config.action_low = [-1.0, -1.0]
+    policy.config.action_high = [1.0, 1.0]
+    # Load dataset_stats for action denormalization if available
+    import json as _json
+    from pathlib import Path as _Path
+    stats_path = _Path(args.checkpoint) / "dataset_stats.json"
+    if stats_path.exists():
+        with open(stats_path) as f:
+            policy.dataset_stats = _json.load(f)
+        stats = policy.dataset_stats.get("action", {})
+        if "min" in stats and "max" in stats:
+            policy._action_min = torch.as_tensor(stats["min"])
+            policy._action_max = torch.as_tensor(stats["max"])
+            print(f"  Action denorm: [{policy._action_min.tolist()}, {policy._action_max.tolist()}]")
     print(f"  Params: {sum(p.numel() for p in policy.model.parameters()):,}")
-    print(f"  CEM: {args.cem_samples}s × {args.cem_iters}i")
+    print(f"  CEM: {args.cem_samples}s × {args.cem_iters}i (bounds [-1,1])")
 
     # Create env
     render_mode = "human" if args.render else "rgb_array"

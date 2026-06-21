@@ -210,27 +210,28 @@ class TestARPredictor:
 
 class TestSIGReg:
     def test_gaussian_low_loss(self):
-        sigreg = SIGReg(knots=17, num_proj=256, embed_dim=64)
-        # Large batch for good statistics
-        gauss = torch.randn(200, 32, 64).transpose(0, 1)  # (T, B, D)
+        sigreg = SIGReg(knots=17, num_proj=256)
+        # Large batch for good statistics — the original formula scales by T
+        gauss = torch.randn(500, 64, 64).transpose(0, 1)  # (T=64, B=500, D=64)
         loss = sigreg(gauss)
-        assert loss.item() < 0.1
+        assert loss.item() < 2.0, f"Gaussian loss {loss.item()} should be < 2.0"
 
     def test_zeros_high_loss(self):
-        sigreg = SIGReg(knots=17, num_proj=256, embed_dim=64)
-        zeros = torch.zeros(200, 32, 64).transpose(0, 1)
+        sigreg = SIGReg(knots=17, num_proj=256)
+        zeros = torch.zeros(500, 64, 64).transpose(0, 1)
         loss = sigreg(zeros)
-        # Zeros should give higher loss than Gaussian
-        gauss = torch.randn(200, 32, 64).transpose(0, 1)
+        gauss = torch.randn(500, 64, 64).transpose(0, 1)
         loss_gauss = sigreg(gauss)
-        assert loss.item() > loss_gauss.item()
+        assert loss.item() > loss_gauss.item(), (
+            f"Zero loss {loss.item()} should be > Gaussian loss {loss_gauss.item()}"
+        )
 
     def test_output_is_scalar(self):
         """SIGReg uses sort() which is non-differentiable — this is expected.
         The regularizer is added to the prediction loss but doesn't backprop
         through the encoder (by design in the original LeWM paper).
         """
-        sigreg = SIGReg(knots=17, num_proj=256, embed_dim=64)
+        sigreg = SIGReg(knots=17, num_proj=256)
         x = torch.randn(200, 32, 64).transpose(0, 1)
         loss = sigreg(x)
         assert loss.ndim == 0

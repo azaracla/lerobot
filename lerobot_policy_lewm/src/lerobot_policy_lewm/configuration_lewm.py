@@ -60,6 +60,9 @@ class LeWMConfig(PreTrainedConfig):
     cem_n_steps: int = 30
     cem_topk: int = 30
     cem_var_scale: float = 1.0
+    cem_init_mean: float | None = 0.0  # 0 = normalized space center
+    action_low: list[float] | None = None  # e.g., [-1.0, -1.0] for normalized
+    action_high: list[float] | None = None  # e.g., [1.0, 1.0] for normalized
 
     # ---- Normalization ----
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -89,24 +92,28 @@ class LeWMConfig(PreTrainedConfig):
 
     # ---- Abstract property implementations ----
 
+    # Temporal stride between consecutive frames (in frame index units).
+    # 5 × 0.1s = 0.5s between frames, matching original LeWM frameskip=5.
+    # At 0.5s spacing, the agent moves enough that action conditioning matters.
+    _frameskip: int = 5
+
     @property
     def observation_delta_indices(self) -> list[int]:
-        """Frame indices for observation sampling.
+        """Frame indices for observation sampling with temporal stride.
 
-        Returns indices [0, 1, ..., n_obs_steps-1] representing sequential
-        frames at the configured FPS.
+        Returns [0, skip, 2*skip, ..., (n_obs_steps-1)*skip].
+        With frameskip=5 and n_obs_steps=4 at 10 fps: [0, 5, 10, 15] = 0s, 0.5s, 1.0s, 1.5s.
         """
-        return list(range(self.n_obs_steps))
+        return [i * self._frameskip for i in range(self.n_obs_steps)]
 
     @property
     def action_delta_indices(self) -> list[int]:
-        """Frame indices for action sampling.
+        """Frame indices for action sampling with temporal stride.
 
-        Returns indices [0, ..., n_obs_steps-2] — one fewer than observations.
-        This gives n_obs_steps observations and n_obs_steps-1 actions.
-        action[t] conditions obs[t] → obs[t+1], so we need N-1 actions for N observations.
+        Returns n_obs_steps-1 indices, matching original LeWM frameskip.
+        action[i] conditions obs[i] → obs[i+1].
         """
-        return list(range(self.n_obs_steps - 1))
+        return [i * self._frameskip for i in range(self.n_obs_steps - 1)]
 
     @property
     def reward_delta_indices(self) -> list[int] | None:

@@ -85,6 +85,7 @@ class JEPA(nn.Module):
         # Action encoder
         self.action_encoder = Embedder(
             input_dim=action_dim,
+            smoothed_dim=10,
             emb_dim=action_emb_dim,
         )
 
@@ -104,19 +105,20 @@ class JEPA(nn.Module):
             hidden_dim=proj_hidden_dim,
             output_dim=embed_dim,
             norm=True,
+            norm_fn=nn.BatchNorm1d,
         )
         self.pred_proj = MLP(
             input_dim=embed_dim,
             hidden_dim=proj_hidden_dim,
             output_dim=embed_dim,
             norm=True,
+            norm_fn=nn.BatchNorm1d,
         )
 
         # Regularizer
         self.sigreg = SIGReg(
             knots=sigreg_knots,
             num_proj=sigreg_num_proj,
-            embed_dim=embed_dim,
         )
 
     def encode(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -244,11 +246,13 @@ class JEPA(nn.Module):
         info = self.rollout(info, action_candidates)
 
         # Cost: MSE between final predicted embedding and goal
-        predicted_final = info["predicted_emb"][:, :, -1]  # (B, S, D)
-        goal_final = info["goal_emb"][:, :, -1]  # (B, 1, D) or (B, D)
-
-        if goal_final.dim() == 2:
-            goal_final = goal_final.unsqueeze(1)  # (B, 1, D)
+        predicted_final = info["predicted_emb"][:, :, -1]  # (B, S, D)  last horizon step
+        # goal_emb is (B, 1, D) — take the temporal embedding, keep full D
+        goal_emb = info["goal_emb"]
+        if goal_emb.dim() == 3:
+            goal_final = goal_emb[:, -1]  # (B, D) take last temporal frame
+        else:
+            goal_final = goal_emb  # (B, D)
 
         # MSE per sample
         costs = ((predicted_final - goal_final) ** 2).mean(dim=-1)  # (B, S)

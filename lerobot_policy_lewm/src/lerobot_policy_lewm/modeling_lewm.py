@@ -54,6 +54,15 @@ class LeWMPolicy(PreTrainedPolicy):
         super().__init__(config)
         self.dataset_stats = dataset_stats
 
+        # Store action normalization params for denormalizing CEM outputs
+        self._action_min = None
+        self._action_max = None
+        if dataset_stats and "action" in dataset_stats:
+            stats = dataset_stats["action"]
+            if "min" in stats and "max" in stats:
+                self._action_min = torch.as_tensor(stats["min"])
+                self._action_max = torch.as_tensor(stats["max"])
+
         # Resolve action dimension from output features
         action_dim = 2  # default
         if config.output_features:
@@ -123,6 +132,7 @@ class LeWMPolicy(PreTrainedPolicy):
         Returns:
             (loss, output_dict) where loss is a scalar tensor.
         """
+        batch["action"] = torch.nan_to_num(batch["action"], 0.0)
         output = self.model(batch, num_preds=self._num_preds)
         loss = output["pred_loss"] + self._sigreg_weight * output["sigreg_loss"]
 
@@ -158,6 +168,14 @@ class LeWMPolicy(PreTrainedPolicy):
             return torch.cat([pad, cached], dim=1)
         return cached[:, -self._history_size:]
 
+    def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Convert normalized action [-1, 1] back to raw action space via MIN_MAX."""
+        if self._action_min is not None and self._action_max is not None:
+            denom = self._action_max - self._action_min
+            return ((action + 1) / 2.0) * denom.to(action.device) + self._action_min.to(action.device)
+        logger.warning("No dataset_stats action min/max — returning actions as-is")
+        return action
+
     def select_action(
         self,
         batch: dict[str, torch.Tensor],
@@ -174,12 +192,19 @@ class LeWMPolicy(PreTrainedPolicy):
         Returns:
             action: (B, action_dim) tensor.
         """
-        B = batch["observation.image"].shape[0]
+        # Handle images without temporal dim: (B, C, H, W) → (B, 1, C, H, W)
         batch_for_encode = {**batch}
+        if batch_for_encode["observation.image"].ndim == 4:
+            batch_for_encode["observation.image"] = batch_for_encode["observation.image"].unsqueeze(1)
+        if "observation.state" in batch_for_encode:
+            if batch_for_encode["observation.state"].ndim == 2:
+                batch_for_encode["observation.state"] = batch_for_encode["observation.state"].unsqueeze(1)
+
+        B = batch_for_encode["observation.image"].shape[0]
 
         # Ensure action key exists with zero placeholder for encoding
-        if "action" not in batch_for_encode:
-            batch_for_encode["action"] = torch.zeros(B, 1, self._action_dim, device=batch["observation.image"].device)
+        if batch_for_encode.get("action") is None:
+            batch_for_encode["action"] = torch.zeros(B, 1, self._action_dim, device=batch_for_encode["observation.image"].device)
 
         was_training = self.model.training
         self.model.eval()
@@ -211,9 +236,9 @@ class LeWMPolicy(PreTrainedPolicy):
                 var_scale=self.config.cem_var_scale,
                 horizon=self._horizon,
                 action_dim=self._action_dim,
-                action_low=getattr(self.config, 'action_low', None),
-                action_high=getattr(self.config, 'action_high', None),
-                init_mean=getattr(self.config, 'cem_init_mean', None),
+                action_low=torch.tensor(self.config.action_low) if self.config.action_low else None,
+                action_high=torch.tensor(self.config.action_high) if self.config.action_high else None,
+                init_mean=self.config.cem_init_mean,
                 device=str(info["emb"].device),
             )
 
@@ -222,7 +247,7 @@ class LeWMPolicy(PreTrainedPolicy):
 
         if was_training:
             self.model.train()
-        return actions[:, 0]  # (B, A)
+        return self._denormalize_action(actions[:, 0])  # (B, A)
 
     def predict_action_chunk(
         self,
@@ -233,10 +258,17 @@ class LeWMPolicy(PreTrainedPolicy):
 
         Returns the full CEM-optimized action horizon as a chunk.
         """
-        B = batch["observation.image"].shape[0]
+        # Handle images without temporal dim: (B, C, H, W) → (B, 1, C, H, W)
         batch_for_encode = {**batch}
-        if "action" not in batch_for_encode:
-            batch_for_encode["action"] = torch.zeros(B, 1, self._action_dim, device=batch["observation.image"].device)
+        if batch_for_encode["observation.image"].ndim == 4:
+            batch_for_encode["observation.image"] = batch_for_encode["observation.image"].unsqueeze(1)
+        if "observation.state" in batch_for_encode:
+            if batch_for_encode["observation.state"].ndim == 2:
+                batch_for_encode["observation.state"] = batch_for_encode["observation.state"].unsqueeze(1)
+
+        B = batch_for_encode["observation.image"].shape[0]
+        if batch_for_encode.get("action") is None:
+            batch_for_encode["action"] = torch.zeros(B, 1, self._action_dim, device=batch_for_encode["observation.image"].device)
 
         was_training = self.model.training
         self.model.eval()
@@ -261,13 +293,16 @@ class LeWMPolicy(PreTrainedPolicy):
                 var_scale=self.config.cem_var_scale,
                 horizon=self._horizon,
                 action_dim=self._action_dim,
+                action_low=torch.tensor(self.config.action_low) if self.config.action_low else None,
+                action_high=torch.tensor(self.config.action_high) if self.config.action_high else None,
+                init_mean=self.config.cem_init_mean,
                 device=str(info["emb"].device),
             )
 
             result = solver.solve(info)
         if was_training:
             self.model.train()
-        return result["actions"]  # (B, H, A)
+        return self._denormalize_action(result["actions"])  # (B, H, A)
 
     def get_optim_params(self) -> dict:
         """Return parameter groups for optimizer.
